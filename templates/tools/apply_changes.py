@@ -1,0 +1,513 @@
+"""Apply agent-approved transitions to status.yaml safely.
+
+Reads:
+    status/status.yaml
+    status/.cache/approved_transitions.json    (written by the agent)
+    status/.cache/changed_files.json           (for snapshot refresh)
+
+Writes:
+    status/status.yaml   (atomic write)
+
+Behavior:
+  - Updates artifact `status` fields.
+  - Registers brand-new artifacts (when transition has new_file: true).
+  - Appends a single `change_events` entry summarizing this run.
+  - Refreshes `snapshots.file_hashes` and `snapshots.git_baseline`.
+  - Preserves every user-authored field on existing artifacts; only the `status`
+    and `last_checked` fields are touched.
+
+approved_transitions.json shape:
+    {
+      "event_summary": "Research R-001 update propagation",   (optional)
+      "transitions": [
+        {
+          "artifact": "Plan.rendering_pipeline",
+          "type": "plan",
+          "from": "approved",
+          "to": "invalidated",
+          "reason": "Research R-001 invalidated assumption A-001",
+          "source": "research/R-001-platform-limit.md"
+        },
+        ...
+        {
+          "artifact": null,
+          "new_file": true,
+          "type": "landing_prompt",
+          "to": "draft",
+          "proposed_id": "LandingPrompt.new_thing",
+          "path": "prompts/landing/LP-007-new-thing.md",
+          "reason": "Newly added landing prompt"
+        }
+      ]
+    }
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _yaml_compat as yaml
+import handoff as ho_helpers
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def next_id(existing_ids: list[str], prefix: str) -> str:
+    n = 1
+    used = set()
+    for x in existing_ids:
+        if isinstance(x, str) and x.startswith(prefix):
+            try:
+                used.add(int(x[len(prefix):]))
+            except ValueError:
+                pass
+    while n in used:
+        n += 1
+    return f"{prefix}{n:03d}"
+
+
+def atomic_write(path: str, text: str):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".status.", suffix=".yaml.tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -------------------- Handoff operation handlers --------------------
+#
+# All handoff operations record a single change_event transition row each. They
+# never overwrite user-authored fields on existing handoffs/artifacts; they only
+# touch the specific field(s) the operation is about.
+
+
+def _apply_handoff_register(status: dict, t: dict) -> Optional[dict]:
+    """Register a new HandoffContext. Idempotent on id collision."""
+    hc_list = status["handoff_contexts"]
+    hc_id = t.get("handoff_id") or t.get("proposed_id")
+    if not hc_id:
+        print(f"[apply_changes] WARN: handoff_register missing handoff_id, skipping: {t}", file=sys.stderr)
+        return None
+    if any(hc.get("id") == hc_id for hc in hc_list):
+        # Already present — treat as no-op (do not overwrite user fields).
+        return {"artifact": hc_id, "from": "exists", "to": "exists",
+                "reason": "handoff_register skipped: id already registered"}
+    producer = t.get("producer")
+    initial_status = t.get("to") or "draft"
+    new_hc = {
+        "id": hc_id,
+        "title": t.get("title", ""),
+        "producer": producer,
+        "producer_type": t.get("producer_type"),
+        "produced_from": t.get("produced_from", []) or [],
+        "status": initial_status,
+        "version": int(t.get("version", 1)),
+        "facts": t.get("facts", []) or [],
+        "results": t.get("results", []) or [],
+        "constraints": t.get("constraints", []) or [],
+        "consumed_by": t.get("consumed_by", []) or [],
+        "consumed_status": _seed_consumed_status(t.get("consumed_by") or []),
+        "invalidated_by": [],
+        "last_verified": now_iso(),
+    }
+    hc_list.append(new_hc)
+    # Wire produces_handoffs onto producer artifact if it exists.
+    if producer:
+        for a in status.get("artifacts") or []:
+            if a.get("id") == producer:
+                ho_helpers.ensure_handoff_fields_on_artifact(a)
+                if hc_id not in a["produces_handoffs"]:
+                    a["produces_handoffs"].append(hc_id)
+                break
+    # Wire consumes_handoffs onto each consumer artifact if it exists.
+    for consumer in new_hc["consumed_by"]:
+        for a in status.get("artifacts") or []:
+            if a.get("id") == consumer:
+                ho_helpers.ensure_handoff_fields_on_artifact(a)
+                if hc_id not in a["consumes_handoffs"]:
+                    a["consumes_handoffs"].append(hc_id)
+                break
+    return {"artifact": hc_id, "from": None, "to": initial_status,
+            "reason": t.get("reason", "Handoff registered")}
+
+
+def _seed_consumed_status(consumers: list) -> list:
+    return [{"consumer": c, "status": "pending", "consumed_version": None, "consumed_at": None}
+            for c in consumers]
+
+
+def _apply_handoff_status(status: dict, t: dict) -> Optional[dict]:
+    """Set a handoff's status. Does NOT touch version or consumed_status."""
+    hc_id = t.get("artifact") or t.get("handoff_id")
+    hc = ho_helpers.get_handoff(status, hc_id)
+    if not hc:
+        print(f"[apply_changes] WARN: handoff_status target {hc_id} not found", file=sys.stderr)
+        return None
+    prev = hc.get("status")
+    new = t.get("to")
+    if new not in ho_helpers.HANDOFF_STATUSES:
+        print(f"[apply_changes] WARN: handoff_status invalid status {new}", file=sys.stderr)
+        return None
+    hc["status"] = new
+    hc["last_verified"] = now_iso()
+    return {"artifact": hc_id, "from": prev, "to": new,
+            "reason": t.get("reason", "Handoff status updated")}
+
+
+def _apply_handoff_version(status: dict, t: dict) -> list:
+    """Bump a handoff's version. Mark prior consumers stale (consumed_version < new).
+    Also writes one transition row per affected consumer."""
+    hc_id = t.get("artifact") or t.get("handoff_id")
+    hc = ho_helpers.get_handoff(status, hc_id)
+    if not hc:
+        print(f"[apply_changes] WARN: handoff_version target {hc_id} not found", file=sys.stderr)
+        return []
+    new_v = t.get("version")
+    if new_v is None:
+        new_v = int(hc.get("version", 1)) + 1
+    try:
+        new_v = int(new_v)
+    except (TypeError, ValueError):
+        print(f"[apply_changes] WARN: handoff_version non-integer version {new_v}", file=sys.stderr)
+        return []
+    prev_v = hc.get("version")
+    hc["version"] = new_v
+    # After a re-confirmed version bump the handoff returns to 'available' unless agent specified.
+    prev_status = hc.get("status")
+    hc["status"] = t.get("to") or "available"
+    hc["last_verified"] = now_iso()
+    rows = [{"artifact": hc_id, "from": f"v{prev_v}/{prev_status}",
+             "to": f"v{new_v}/{hc['status']}",
+             "reason": t.get("reason", "Handoff version bumped")}]
+    # Mark consumers below the new version as stale.
+    for ce in hc.get("consumed_status") or []:
+        cv = ce.get("consumed_version")
+        if cv is None or (isinstance(cv, int) and cv < new_v):
+            prev_cs = ce.get("status")
+            if prev_cs != "stale":
+                ce["status"] = "stale"
+                rows.append({
+                    "artifact": f"{hc_id}:{ce.get('consumer')}", "from": prev_cs, "to": "stale",
+                    "reason": f"Consumer absorbed v{cv}, handoff now v{new_v}"
+                })
+    return rows
+
+
+def _apply_handoff_consume(status: dict, t: dict) -> Optional[dict]:
+    """Record that a consumer has absorbed (or rejected) a specific handoff version."""
+    hc_id = t.get("artifact") or t.get("handoff_id")
+    consumer = t.get("consumer")
+    if not consumer:
+        print(f"[apply_changes] WARN: handoff_consume missing consumer", file=sys.stderr)
+        return None
+    hc = ho_helpers.get_handoff(status, hc_id)
+    if not hc:
+        print(f"[apply_changes] WARN: handoff_consume target {hc_id} not found", file=sys.stderr)
+        return None
+    if consumer not in (hc.get("consumed_by") or []):
+        print(f"[apply_changes] WARN: handoff_consume {consumer} not in {hc_id}.consumed_by", file=sys.stderr)
+        return None
+    consumed_version = t.get("consumed_version")
+    if consumed_version is None:
+        consumed_version = hc.get("version", 1)
+    try:
+        consumed_version = int(consumed_version)
+    except (TypeError, ValueError):
+        print(f"[apply_changes] WARN: handoff_consume non-integer consumed_version", file=sys.stderr)
+        return None
+    new_status = t.get("to") or "consumed"
+    if new_status not in ho_helpers.CONSUMER_STATUSES:
+        print(f"[apply_changes] WARN: handoff_consume invalid consumer status {new_status}", file=sys.stderr)
+        return None
+    if status.get("handoff_contexts") and hc.get("consumed_status") is None:
+        hc["consumed_status"] = []
+    cs_list = hc.setdefault("consumed_status", [])
+    entry = next((x for x in cs_list if x.get("consumer") == consumer), None)
+    prev_status = entry.get("status") if entry else None
+    if entry is None:
+        entry = {"consumer": consumer}
+        cs_list.append(entry)
+    entry["status"] = new_status
+    entry["consumed_version"] = consumed_version if new_status != "rejected" else None
+    entry["consumed_at"] = now_iso()
+    if new_status == "rejected" and t.get("reason"):
+        entry["reason"] = t["reason"]
+    # Aggregate handoff status from consumer states.
+    all_consumed = all(
+        (x.get("status") == "consumed" and x.get("consumed_version") == hc.get("version"))
+        for x in cs_list
+    ) if cs_list else False
+    some_consumed = any(x.get("status") == "consumed" for x in cs_list)
+    if hc.get("status") not in ho_helpers.BLOCKING_HANDOFF_STATUSES:
+        if all_consumed:
+            hc["status"] = "consumed"
+        elif some_consumed:
+            hc["status"] = "partially_consumed"
+    return {"artifact": f"{hc_id}:{consumer}",
+            "from": prev_status, "to": new_status,
+            "reason": t.get("reason", f"Consumer {consumer} marked {new_status}")}
+
+
+# -------------------- Imports kept local to avoid circular import --------------------
+from typing import Optional
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project", default=".")
+    args = ap.parse_args()
+    project = os.path.abspath(args.project)
+
+    status_path = os.path.join(project, "status", "status.yaml")
+    approved_path = os.path.join(project, "status", ".cache", "approved_transitions.json")
+    changed_path = os.path.join(project, "status", ".cache", "changed_files.json")
+
+    if not os.path.isfile(status_path):
+        print("[apply_changes] FAIL: status.yaml not found", file=sys.stderr)
+        sys.exit(2)
+    if not os.path.isfile(approved_path):
+        print("[apply_changes] no approved_transitions.json — nothing to apply")
+        sys.exit(0)
+
+    with open(status_path, "r", encoding="utf-8") as f:
+        status = yaml.load(f.read()) or {}
+    with open(approved_path, "r", encoding="utf-8") as f:
+        approved = json.load(f) or {}
+
+    transitions = approved.get("transitions") or []
+    event_summary = approved.get("event_summary") or "Skill run state propagation"
+
+    if not transitions:
+        # Even on a no-op run, refresh the AI-facing meta block so its
+        # last_run timestamp and counts reflect reality.
+        try:
+            from meta import refresh_meta
+        except Exception:
+            import sys as _sys, os as _os
+            _sys.path.insert(0, _os.path.dirname(__file__))
+            from meta import refresh_meta
+        refresh_meta(status)
+        atomic_write(status_path, yaml.dump(status))
+        print("[apply_changes] approved_transitions.json had no transitions (meta refreshed)")
+        sys.exit(0)
+
+    if status.get("artifacts") is None:
+        status["artifacts"] = []
+    if status.get("handoff_contexts") is None:
+        status["handoff_contexts"] = []
+    artifacts = status["artifacts"]
+    by_id = {a["id"]: a for a in artifacts}
+
+    # Backfill produces_handoffs / consumes_handoffs on existing artifacts (idempotent).
+    for a in artifacts:
+        ho_helpers.ensure_handoff_fields_on_artifact(a)
+
+    affected = []
+    recorded_transitions = []
+    sources = set()
+
+    for t in transitions:
+        sources.add(t.get("source", ""))
+        op = t.get("op", "")
+
+        # ---------- Handoff operations ----------
+        if op == "handoff_register":
+            ce_entry = _apply_handoff_register(status, t)
+            if ce_entry:
+                recorded_transitions.append(ce_entry)
+                affected.append(ce_entry["artifact"])
+            continue
+        if op == "handoff_status":
+            ce_entry = _apply_handoff_status(status, t)
+            if ce_entry:
+                recorded_transitions.append(ce_entry)
+                affected.append(ce_entry["artifact"])
+            continue
+        if op == "handoff_version":
+            entries = _apply_handoff_version(status, t)
+            for e in entries:
+                recorded_transitions.append(e)
+                affected.append(e["artifact"])
+            continue
+        if op == "handoff_consume":
+            ce_entry = _apply_handoff_consume(status, t)
+            if ce_entry:
+                recorded_transitions.append(ce_entry)
+                affected.append(ce_entry["artifact"])
+            continue
+
+        # ---------- New file registrations and artifact updates ----------
+        if t.get("new_file"):
+            target_type = t.get("type", "plan")
+            new_id = t.get("proposed_id")
+            if not new_id:
+                print(f"[apply_changes] WARN: new_file transition missing proposed_id, skipping: {t}", file=sys.stderr)
+                continue
+            # Research findings register in research_findings[], not artifacts[].
+            if target_type == "research":
+                if status.get("research_findings") is None:
+                    status["research_findings"] = []
+                rf_list = status["research_findings"]
+                if any(rf.get("id") == new_id for rf in rf_list):
+                    recorded_transitions.append({
+                        "artifact": new_id, "from": None, "to": "draft",
+                        "reason": t.get("reason", "") + " (already present)"
+                    })
+                else:
+                    rf_list.append({
+                        "id": new_id,
+                        "title": t.get("title", ""),
+                        "path": t.get("path"),
+                        "type": "finding",
+                        "confidence": t.get("confidence", "medium"),
+                        "evidence": t.get("evidence", []) or [],
+                        "affects": t.get("affects", []) or [],
+                        "invalidates": t.get("invalidates", []) or [],
+                        "status_effect": t.get("status_effect", []) or [],
+                    })
+                    recorded_transitions.append({
+                        "artifact": new_id, "from": None, "to": "registered",
+                        "reason": t.get("reason", "")
+                    })
+                affected.append(new_id)
+                continue
+            # Decisions register in decisions[], not artifacts[].
+            if target_type == "decision":
+                if status.get("decisions") is None:
+                    status["decisions"] = []
+                d_list = status["decisions"]
+                if not any(d.get("id") == new_id for d in d_list):
+                    d_list.append({
+                        "id": new_id,
+                        "title": t.get("title", ""),
+                        "path": t.get("path"),
+                        "status": t.get("to", "draft"),
+                        "based_on": t.get("based_on", []) or [],
+                        "rejects": t.get("rejects", []) or [],
+                        "affects": t.get("affects", []) or [],
+                    })
+                recorded_transitions.append({
+                    "artifact": new_id, "from": None, "to": t.get("to", "draft"),
+                    "reason": t.get("reason", "")
+                })
+                affected.append(new_id)
+                continue
+            if new_id in by_id:
+                # Already registered (maybe a prior run). Treat as modification.
+                a = by_id[new_id]
+                prev = a.get("status")
+                a["status"] = t.get("to", a.get("status", "draft"))
+                a["last_checked"] = now_iso()
+                recorded_transitions.append({
+                    "artifact": new_id, "from": prev, "to": a["status"], "reason": t.get("reason", "")
+                })
+                affected.append(new_id)
+            else:
+                new_art = {
+                    "id": new_id,
+                    "type": target_type,
+                    "path": t.get("path"),
+                    "status": t.get("to", "draft"),
+                    "depends_on": t.get("depends_on", []) or [],
+                    "affected_by": t.get("affected_by", []) or [],
+                    "blocks": [],
+                    "blocked_by": [],
+                    "invalidated_by": [],
+                    "last_checked": now_iso(),
+                }
+                artifacts.append(new_art)
+                by_id[new_id] = new_art
+                recorded_transitions.append({
+                    "artifact": new_id, "from": None, "to": new_art["status"],
+                    "reason": t.get("reason", "")
+                })
+                affected.append(new_id)
+        else:
+            aid = t.get("artifact")
+            if not aid:
+                continue
+            # Handle preconditions and other non-artifact targets via a parallel path.
+            if t.get("type") == "precondition":
+                for pc in status.get("preconditions") or []:
+                    if pc.get("id") == aid:
+                        prev = pc.get("status")
+                        pc["status"] = t["to"]
+                        recorded_transitions.append({
+                            "artifact": aid, "from": prev, "to": pc["status"],
+                            "reason": t.get("reason", "")
+                        })
+                        affected.append(aid)
+                        break
+                continue
+            a = by_id.get(aid)
+            if not a:
+                print(f"[apply_changes] WARN: artifact {aid} not found, skipping", file=sys.stderr)
+                continue
+            prev = a.get("status")
+            a["status"] = t["to"]
+            a["last_checked"] = now_iso()
+            recorded_transitions.append({
+                "artifact": aid, "from": prev, "to": a["status"], "reason": t.get("reason", "")
+            })
+            affected.append(aid)
+
+    # Record change event.
+    if status.get("change_events") is None:
+        status["change_events"] = []
+    change_events = status["change_events"]
+    existing_ce_ids = [ce.get("id") for ce in change_events]
+    ce_id = next_id(existing_ce_ids, "CE-")
+    change_events.append({
+        "id": ce_id,
+        "time": now_iso(),
+        "source": "; ".join(sorted(s for s in sources if s)) or "skill_run",
+        "event_type": approved.get("event_type", "skill_run"),
+        "summary": event_summary,
+        "affected": sorted(set(affected)),
+        "transitions": recorded_transitions,
+    })
+
+    # Refresh snapshots.
+    if status.get("snapshots") is None:
+        status["snapshots"] = {}
+    snap = status["snapshots"]
+    if os.path.isfile(changed_path):
+        with open(changed_path, "r", encoding="utf-8") as f:
+            changed = json.load(f) or {}
+        if changed.get("current_hashes"):
+            snap["file_hashes"] = changed["current_hashes"]
+        if changed.get("method") == "git" and changed.get("head"):
+            snap["git_baseline"] = changed["head"]
+
+    # Refresh AI-facing meta block so the top of status.yaml always reflects
+    # the just-applied state.
+    try:
+        from meta import refresh_meta
+    except Exception:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(__file__))
+        from meta import refresh_meta
+    refresh_meta(status, event_id=ce_id)
+
+    text = yaml.dump(status)
+    atomic_write(status_path, text)
+
+    print(f"[apply_changes] applied {len(transitions)} transition(s), wrote {ce_id}")
+
+
+if __name__ == "__main__":
+    main()

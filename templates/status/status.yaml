@@ -1,0 +1,64 @@
+project:
+  name: unknown_project
+  phase: pre_research
+  version: 0.1.0
+
+# AI-READ-FIRST: This meta block is auto-refreshed by apply_changes.py / render_status.py.
+# An AI agent reading this file can rely on these counts to skip parsing the full document
+# when only a high-level summary is needed.
+meta:
+  schema_version: 1
+  last_run: null
+  last_event: null
+  summary:
+    artifacts_total: 0
+    artifacts_ready: 0
+    artifacts_blocked: 0
+    artifacts_needs_update: 0
+    blockers_open: 0
+    gates_failed: 0
+    handoffs_total: 0
+    handoffs_stale: 0
+    handoffs_invalidated: 0
+    handoffs_pending_consumers: 0
+  hotspots: []        # Top-priority items the AI should look at first (auto-filled).
+  pointers:
+    entry_point: AGENTS.md
+    views_dir: views/
+    status_report: views/status_report.md
+    handoff_view: views/handoff_view.md
+    prompt_chain: views/prompt_chain_view.md
+
+artifacts: []
+
+research_findings: []
+
+evidence: []
+
+assumptions: []
+
+decisions: []
+
+blockers: []
+
+gates: []
+
+preconditions: []
+
+dependencies: []
+
+change_events: []
+
+handoff_contexts: []
+
+snapshots:
+  enabled: true
+  git_baseline: null
+  file_hashes: {}
+
+rules:
+  research_is_fact_only: true
+  status_is_single_source_of_truth: true
+  landing_requires_test_ready: true
+  plan_invalidates_landing: true
+  landing_invalidates_test: true
