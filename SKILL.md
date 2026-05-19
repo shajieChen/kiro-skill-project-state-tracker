@@ -52,16 +52,27 @@ blocked → draft | reviewed
 Any non-terminal → invalidated | deprecated | archived
 ```
 
-**External executor privilege (Execute-LandingPrompt):**
+**Who walks the chain (B2):** `apply_changes.py` does **not** enforce the chain — it accepts any `from→to` pair written through approved_transitions. Three actors drive transitions, with distinct privileges:
 
-ELP is a trusted external executor that writes status.yaml directly (or via apply_changes.py when available) — it is reviewer+approver+executor for LP artifacts in one. Concrete accommodations:
+| Actor | Allowed shortcuts | Mechanism |
+|---|---|---|
+| `project-state-spec` (PSS) | `null → draft` only (registration) | Direct apply_changes |
+| `Execute-LandingPrompt` (ELP) | `draft → ready`, `ready ↔ needs_update`, `ready ↔ blocked` (collapses chain for LP only) | approved_transitions with `source: Execute-LandingPrompt` |
+| AUDIT Step 4 reviewer (PST agent) | All non-terminal transitions for R / D / Plan / TP — promotes drafts forward, marks needs_update, etc. | Agent populates approved_transitions during AUDIT |
+
+Manual user file edits picked up by `scan_changes` produce candidates that the AUDIT reviewer agent decides on. There is no automatic `draft → reviewed → approved → ready` walker — drafts only advance when the AUDIT reviewer or a trusted external executor moves them.
+
+**External executor privilege (Execute-LandingPrompt & project-state-spec):**
+
+ELP is a trusted external executor that writes status.yaml directly (or via apply_changes.py when available) — it is reviewer+approver+executor for LP artifacts in one. `project-state-spec` is a trusted scaffolding source that writes brand-new artifacts in `draft` status via apply_changes.py. Concrete accommodations:
 
 | Aspect | Rule |
 |---|---|
-| Whitelisted LP transitions | `ready→ready`, `ready→needs_update`, `ready→blocked`, `needs_update→ready`, `blocked→ready` (collapses the `needs_update→draft→reviewed→approved→ready` chain — ELP performs all intermediate steps atomically) |
+| Whitelisted LP transitions (ELP) | `ready→ready`, `ready→needs_update`, `ready→blocked`, `needs_update→ready`, `blocked→ready` (collapses the `needs_update→draft→reviewed→approved→ready` chain — ELP performs all intermediate steps atomically) |
+| Whitelisted scaffold transitions (project-state-spec) | `null→draft` for R / D / Plan / LP / TP — registers brand-new artifacts; AUDIT auto-approves at high confidence |
 | `path: "external:*"` artifacts | scan_changes (subsumes legacy dirty_check) skips them; only ELP or manual user action transitions their state |
-| AUDIT Step 4 vs `source: Execute-LandingPrompt` | auto-approve at high confidence (trusted source); PST is second-line reviewer |
-| State-machine validation | NOT enforced by `apply_changes.py` on ELP writes — ELP is contractually responsible for emitting only whitelisted transitions |
+| AUDIT Step 4 vs `source: Execute-LandingPrompt` or `source: project-state-spec` | auto-approve at high confidence (trusted source); PST is second-line reviewer |
+| State-machine validation | NOT enforced by `apply_changes.py` on trusted-source writes — the trusted source is contractually responsible for emitting only whitelisted transitions |
 
 ---
 
@@ -264,7 +275,7 @@ Next AUDIT: skip unchanged files; re-present pending suggestions. Delete on INIT
 **ID** (first match wins):
 1. Filename pattern: `R-001-*.md` → `R-001`, `D-001-*.yaml` → `D-001`, `LP-001-*.md` → `LP-001`, `TP-001-*.md` → `TP-001`
 2. YAML front-matter `id:` field
-3. H1 with prefix: `# R-001: Title` → `R-001`
+3. H1 with prefix: `# R-001: Title` → `R-001`; `# Plan.<topic>: Title` → `Plan.<topic>` (project-state-spec convention)
 4. Fallback: slugify → `Plan.<stem>`, `LP.<stem>`, `TP.<stem>`
 
 **Title** (first match): YAML `title:` → H1 text → humanized filename

@@ -37,7 +37,21 @@ def main():
     if not os.path.isfile(status_path):
         fail(f"status.yaml not found at {status_path}")
     if not os.path.isfile(schema_path):
-        fail(f"schema.yaml not found at {schema_path}")
+        # B3 fix: fall back to the schema bundled next to this script so a
+        # missing user-side schema.yaml doesn't permanently red-light the
+        # quality gate. Auto-copy it into the project so subsequent runs and
+        # other tools see a real file at the canonical location.
+        bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "_schema_default.yaml")
+        if not os.path.isfile(bundled):
+            fail(f"schema.yaml not found at {schema_path} (and bundled "
+                 f"fallback missing at {bundled})")
+        warn(f"schema.yaml missing at {schema_path}; copied bundled default "
+             f"from {bundled}")
+        os.makedirs(os.path.dirname(schema_path), exist_ok=True)
+        with open(bundled, "r", encoding="utf-8") as src, \
+             open(schema_path, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
 
     with open(status_path, "r", encoding="utf-8") as f:
         status = yaml.load(f.read()) or {}

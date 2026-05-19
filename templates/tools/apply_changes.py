@@ -15,7 +15,6 @@ Behavior:
   - Refreshes `snapshots.file_hashes` and `snapshots.git_baseline`.
   - Preserves every user-authored field on existing artifacts; only the `status`
     and `last_checked` fields are touched.
-
 approved_transitions.json shape:
     {
       "event_summary": "Research R-001 update propagation",   (optional)
@@ -45,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
@@ -86,6 +86,54 @@ def atomic_write(path: str, text: str):
         except OSError:
             pass
         raise
+
+
+def _hash_file(abs_path: str) -> str:
+    """Return sha256 hex digest of file at abs_path, or '' if unreadable."""
+    h = hashlib.sha256()
+    try:
+        with open(abs_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _seed_snapshot_from_transitions(status: dict, project: str,
+                                    transitions: list) -> None:
+    """B6 fix: hash any file path referenced by a transition and merge into
+    snapshots.file_hashes.
+
+    Both PSS and ELP invoke apply_changes without first running scan_changes,
+    so the old behaviour (only refresh from changed_files.json) left
+    file_hashes empty forever. As a result the next scan_changes flagged every
+    tracked file as 'added' and propagate.py emitted spurious needs_update
+    candidates.
+
+    Hashing is cheap (sha256 of small markdown/yaml). Missing files are
+    silently skipped — the path may simply not exist yet for non-new_file
+    transitions.
+    """
+    if not transitions:
+        return
+    if status.get("snapshots") is None:
+        status["snapshots"] = {}
+    snap = status["snapshots"]
+    fh = snap.get("file_hashes")
+    if not isinstance(fh, dict):
+        fh = {}
+        snap["file_hashes"] = fh
+    for t in transitions:
+        rel = t.get("path")
+        if not isinstance(rel, str) or not rel:
+            continue
+        abs_path = os.path.join(project, rel)
+        if not os.path.isfile(abs_path):
+            continue
+        digest = _hash_file(abs_path)
+        if digest:
+            fh[rel] = digest
 
 
 # -------------------- Handoff operation handlers --------------------
@@ -266,6 +314,121 @@ def _apply_handoff_consume(status: dict, t: dict) -> Optional[dict]:
 from typing import Optional
 
 
+# -------------------- Precondition operation handler --------------------
+#
+# Per PST §6C, every Landing Prompt must have preconditions guarding upstream
+# Plan readiness (and optionally downstream TP / consumed HC versions). PSS
+# emits `precondition_register` transitions when scaffolding LP artifacts so
+# the PCs are created exactly once, idempotently, with structured `requires[]`
+# clauses that propagate.py / validate_status.py can evaluate.
+
+_VALID_PC_STATUSES = {"pending", "passed", "failed", "skipped"}
+
+
+def _next_pc_id(status: dict) -> str:
+    used = {p.get("id") for p in (status.get("preconditions") or [])}
+    n = 1
+    while f"PC-{n:03d}" in used:
+        n += 1
+    return f"PC-{n:03d}"
+
+
+def _ensure_lp_gate(status: dict, pc_id: str) -> Optional[dict]:
+    """Make sure Gate G-001 exists and references the new PC.
+
+    Returns a change_event row when the gate was newly created or updated.
+    """
+    gates = status.get("gates")
+    if gates is None:
+        status["gates"] = []
+        gates = status["gates"]
+    gate = next((g for g in gates if g.get("id") == "G-001"), None)
+    created = False
+    if gate is None:
+        gate = {
+            "id": "G-001",
+            "name": "Landing Prompt readiness",
+            "status": "pending",
+            "checks": [],
+        }
+        gates.append(gate)
+        created = True
+    checks = gate.setdefault("checks", [])
+    if not any(c.get("id") == pc_id for c in checks):
+        checks.append({"id": pc_id, "description": f"Precondition {pc_id}",
+                       "status": "pending"})
+        return {"artifact": "G-001",
+                "from": None if created else "exists",
+                "to": "pending",
+                "reason": f"Gate references new PC {pc_id}"}
+    return None
+
+
+def _apply_precondition_register(status: dict, t: dict) -> list:
+    """Register a new precondition. Idempotent on (target, requires) tuple.
+
+    Transition shape:
+        {op: precondition_register,
+         target: "LP-001",
+         requires: [{artifact: "Plan.x", field: "status",
+                     condition: "in [approved, ready]"}, ...],
+         proposed_id?: "PC-001",            # optional, allocated if absent
+         status?: "pending",
+         reason?: "...",
+         source: "..."}
+    """
+    target = t.get("target")
+    requires = t.get("requires") or []
+    if not target:
+        print("[apply_changes] WARN: precondition_register missing target, skipping",
+              file=sys.stderr)
+        return []
+    if not isinstance(requires, list) or not requires:
+        print(f"[apply_changes] WARN: precondition_register for {target} has empty requires",
+              file=sys.stderr)
+        return []
+
+    pcs = status.get("preconditions")
+    if pcs is None:
+        status["preconditions"] = []
+        pcs = status["preconditions"]
+
+    # Idempotency: same target + same requires set already registered -> no-op.
+    def _norm(r):
+        return (r.get("artifact") or r.get("handoff"), r.get("field"),
+                r.get("condition"))
+    new_sig = sorted(_norm(r) for r in requires)
+    for existing in pcs:
+        if existing.get("target") != target:
+            continue
+        ex_sig = sorted(_norm(r) for r in (existing.get("requires") or []))
+        if ex_sig == new_sig:
+            return [{"artifact": existing.get("id"),
+                     "from": existing.get("status"),
+                     "to": existing.get("status"),
+                     "reason": "precondition_register skipped: already present"}]
+
+    pc_id = t.get("proposed_id") or _next_pc_id(status)
+    init_status = t.get("status", "pending")
+    if init_status not in _VALID_PC_STATUSES:
+        init_status = "pending"
+    pc = {
+        "id": pc_id,
+        "target": target,
+        "requires": requires,
+        "status": init_status,
+    }
+    pcs.append(pc)
+    rows = [{"artifact": pc_id, "from": None, "to": init_status,
+             "reason": t.get("reason", f"Precondition registered for {target}")}]
+    # Auto-wire to G-001 when the target is a Landing Prompt.
+    if isinstance(target, str) and target.startswith("LP-"):
+        gate_row = _ensure_lp_gate(status, pc_id)
+        if gate_row:
+            rows.append(gate_row)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", default=".")
@@ -293,7 +456,23 @@ def main():
 
     if not transitions:
         # Even on a no-op run, refresh the AI-facing meta block so its
-        # last_run timestamp and counts reflect reality.
+        # last_run timestamp and counts reflect reality. Also drain
+        # changed_files.json into snapshots if scan_changes was run first
+        # (this is how `scan_changes -> apply_changes` baseline-seeds).
+        if os.path.isfile(changed_path):
+            try:
+                with open(changed_path, "r", encoding="utf-8") as f:
+                    changed = json.load(f) or {}
+            except Exception:
+                changed = {}
+            if changed.get("current_hashes"):
+                if status.get("snapshots") is None:
+                    status["snapshots"] = {}
+                status["snapshots"]["file_hashes"] = changed["current_hashes"]
+            if changed.get("method") == "git" and changed.get("head"):
+                if status.get("snapshots") is None:
+                    status["snapshots"] = {}
+                status["snapshots"]["git_baseline"] = changed["head"]
         try:
             from meta import refresh_meta
         except Exception:
@@ -350,6 +529,14 @@ def main():
                 affected.append(ce_entry["artifact"])
             continue
 
+        # ---------- Precondition operations ----------
+        if op == "precondition_register":
+            rows = _apply_precondition_register(status, t)
+            for r in rows:
+                recorded_transitions.append(r)
+                affected.append(r["artifact"])
+            continue
+
         # ---------- New file registrations and artifact updates ----------
         if t.get("new_file"):
             target_type = t.get("type", "plan")
@@ -358,7 +545,7 @@ def main():
                 print(f"[apply_changes] WARN: new_file transition missing proposed_id, skipping: {t}", file=sys.stderr)
                 continue
             # Research findings register in research_findings[], not artifacts[].
-            if target_type == "research":
+            if target_type in ("research", "research_finding"):
                 if status.get("research_findings") is None:
                     status["research_findings"] = []
                 rf_list = status["research_findings"]
@@ -492,6 +679,11 @@ def main():
             snap["file_hashes"] = changed["current_hashes"]
         if changed.get("method") == "git" and changed.get("head"):
             snap["git_baseline"] = changed["head"]
+    # B6 fix: ALWAYS merge per-transition path hashes so PSS/ELP callers (which
+    # don't pre-run scan_changes) keep snapshots in sync. Runs AFTER the
+    # changed_files.json drain above so a full-tree scan_changes table is
+    # authoritative when both are present.
+    _seed_snapshot_from_transitions(status, project, transitions)
 
     # Refresh AI-facing meta block so the top of status.yaml always reflects
     # the just-applied state.
