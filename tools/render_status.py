@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 
@@ -804,19 +805,73 @@ def render_landing_readme(status: dict, project: str) -> str:
     return new_frontmatter + "\n\n" + new_body
 
 
-def write_landing_readme_with_preservation(path: str, new_content: str, status: dict):
+def _parse_frontmatter_dict(fm_text: str) -> dict:
+    """Tiny YAML-ish front-matter parser limited to `key: "value"` and `key: value`.
+
+    Used only to read `lp_sequence_source`. Avoids pulling a YAML dep just for this.
+    Returns an empty dict on parse failure (caller will fall back to "user").
+    """
+    out = {}
+    if not fm_text:
+        return out
+    lines = fm_text.strip().splitlines()
+    # strip leading/trailing --- fence if present
+    if lines and lines[0].strip() == "---":
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "---":
+        lines = lines[:-1]
+    for raw in lines:
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value:
+            out[key] = value
+    return out
+
+
+def _lp_sequence_body(section_text: str) -> str:
+    """Normalize a ## LP 序列 section to the body lines after the heading."""
+    if not section_text:
+        return ""
+    lines = section_text.splitlines()
+    # drop the heading line
+    if lines and lines[0].lstrip().startswith("## "):
+        lines = lines[1:]
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def write_landing_readme_with_preservation(path: str, new_content: str, status: dict, project: str = None):
     """Write landing README preserving user front-matter and user-authored LP sequence.
-    
-    Preservation rules:
-    1. If file exists with YAML front-matter -> preserve the front-matter, replace body
-    2. If file exists with a user-authored LP sequence section -> preserve that section
-       (detected by: section content differs from what topological sort would generate)
-    3. If file does not exist -> write new_content as-is
+
+    Preservation rules (G1 fix: lp_sequence_source-driven, hash-anchored):
+    1. If file does not exist -> write new_content as-is.
+    2. If front-matter has `lp_sequence_source: "auto"`:
+       - Read `<project>/status/.cache/lp_sequence_hash.txt` (the last-known-auto body hash).
+       - Compute sha256 of the CURRENT on-disk LP sequence body.
+       - If hash file missing OR matches stored -> treat as agent-owned: regenerate from
+         `new_content` and persist the new body's sha256 to the hash file (establishes/refreshes
+         baseline so the next run can detect human edits). Keep front-matter as-is.
+       - If hash differs (human edited the body since last auto-write) -> flip front-matter
+         `lp_sequence_source` to "user", preserve the existing LP sequence section verbatim,
+         and clear the hash file (no longer authoritative).
+    3. If front-matter has `lp_sequence_source: "user"` OR the flag is absent (fail-safe):
+       - Preserve existing LP sequence section verbatim if it exists.
+    4. Front-matter (other keys) is always preserved if the existing file has one.
     """
     if not os.path.isfile(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
+        # On first write, if new_content carries an LP sequence section AND front-matter
+        # marks it auto, seed the baseline hash so subsequent renders can detect edits.
+        if project:
+            try:
+                _maybe_seed_lp_sequence_hash(path, new_content, project)
+            except Exception:
+                pass
         return
 
     existing = ""
@@ -834,7 +889,6 @@ def write_landing_readme_with_preservation(path: str, new_content: str, status: 
 
     # Extract existing LP sequence section (## LP 序列)
     existing_lp_section = None
-    lp_heading = "## LP \u5e8f\u5217"
     lp_pattern = re.compile(r"(## LP \u5e8f\u5217\s*\n)(.*?)(?=\n## |\Z)", re.DOTALL)
     lp_match = lp_pattern.search(existing_body)
     if lp_match:
@@ -849,21 +903,92 @@ def write_landing_readme_with_preservation(path: str, new_content: str, status: 
             new_fm = new_content[:second_dash + 3]
             new_body = new_content[second_dash + 3:].lstrip("\n")
 
-    # Use existing front-matter if present, otherwise use generated
-    final_fm = existing_fm if existing_fm else new_fm
+    # G1: lp_sequence_source-aware preservation
+    fm_dict = _parse_frontmatter_dict(existing_fm)
+    # Fail-safe default: absent flag means "user" (never silently overwrite).
+    lp_source = fm_dict.get("lp_sequence_source", "user").strip().lower()
 
-    # If existing LP sequence exists and differs from generated, preserve it
-    if existing_lp_section:
-        new_lp_match = lp_pattern.search(new_body)
-        if new_lp_match:
-            generated_lp = new_lp_match.group(0).strip()
-            if existing_lp_section != generated_lp:
-                # User has customized LP sequence — preserve it
+    final_fm = existing_fm if existing_fm else new_fm
+    new_lp_match = lp_pattern.search(new_body)
+
+    if existing_lp_section and new_lp_match:
+        if lp_source == "auto" and project:
+            cache_dir = os.path.join(project, "status", ".cache")
+            hash_file = os.path.join(cache_dir, "lp_sequence_hash.txt")
+            existing_body_norm = _lp_sequence_body(existing_lp_section)
+            existing_hash = hashlib.sha256(existing_body_norm.encode("utf-8")).hexdigest()
+
+            stored_hash = None
+            if os.path.isfile(hash_file):
+                try:
+                    with open(hash_file, "r", encoding="utf-8") as f:
+                        stored_hash = f.read().strip() or None
+                except Exception:
+                    stored_hash = None
+
+            if stored_hash is None or stored_hash == existing_hash:
+                # Agent-owned: regenerate and refresh baseline.
+                generated_body_norm = _lp_sequence_body(new_lp_match.group(0))
+                new_hash = hashlib.sha256(generated_body_norm.encode("utf-8")).hexdigest()
+                os.makedirs(cache_dir, exist_ok=True)
+                try:
+                    with open(hash_file, "w", encoding="utf-8") as f:
+                        f.write(new_hash)
+                except Exception:
+                    pass
+                # Leave new_body as-is (use the freshly generated LP section).
+            else:
+                # Human edited the body since last auto-write: flip flag, preserve content.
                 new_body = new_body[:new_lp_match.start()] + existing_lp_section + "\n" + new_body[new_lp_match.end():]
+                if final_fm:
+                    if "lp_sequence_source:" in final_fm:
+                        final_fm = re.sub(
+                            r"lp_sequence_source:\s*\"?[a-zA-Z]+\"?",
+                            'lp_sequence_source: "user"',
+                            final_fm,
+                        )
+                    else:
+                        final_fm = final_fm.rstrip()
+                        if final_fm.endswith("---"):
+                            final_fm = final_fm[:-3].rstrip() + '\nlp_sequence_source: "user"\n---'
+                # Clear baseline — no longer authoritative.
+                try:
+                    if os.path.isfile(hash_file):
+                        os.remove(hash_file)
+                except Exception:
+                    pass
+        else:
+            # lp_source == "user" (explicit or fail-safe) — preserve verbatim regardless of diff.
+            new_body = new_body[:new_lp_match.start()] + existing_lp_section + "\n" + new_body[new_lp_match.end():]
 
     final = final_fm + "\n\n" + new_body if final_fm else new_body
     with open(path, "w", encoding="utf-8") as f:
         f.write(final)
+
+
+def _maybe_seed_lp_sequence_hash(readme_path: str, content: str, project: str) -> None:
+    """On first-write, if front-matter declares auto and an LP section exists,
+    persist its sha256 as the baseline for future edit detection."""
+    if not content.startswith("---"):
+        return
+    second_dash = content.find("---", 3)
+    if second_dash == -1:
+        return
+    fm = content[:second_dash + 3]
+    body = content[second_dash + 3:]
+    fm_dict = _parse_frontmatter_dict(fm)
+    if fm_dict.get("lp_sequence_source", "").strip().lower() != "auto":
+        return
+    lp_pattern = re.compile(r"(## LP \u5e8f\u5217\s*\n)(.*?)(?=\n## |\Z)", re.DOTALL)
+    m = lp_pattern.search(body)
+    if not m:
+        return
+    body_norm = _lp_sequence_body(m.group(0))
+    h = hashlib.sha256(body_norm.encode("utf-8")).hexdigest()
+    cache_dir = os.path.join(project, "status", ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(os.path.join(cache_dir, "lp_sequence_hash.txt"), "w", encoding="utf-8") as f:
+        f.write(h)
 
 
 
@@ -907,7 +1032,7 @@ def main():
     os.makedirs(landing_dir, exist_ok=True)
     landing_readme_content = render_landing_readme(status, project)
     landing_readme_path = os.path.join(landing_dir, "README.md")
-    write_landing_readme_with_preservation(landing_readme_path, landing_readme_content, status)
+    write_landing_readme_with_preservation(landing_readme_path, landing_readme_content, status, project)
     print(f"  Rendered: {landing_readme_path}")
 
     print("[render_status] regenerated 7 views + AGENTS.md + 2 READMEs")

@@ -40,10 +40,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _yaml_compat as yaml
 
 
-# NOTE: Only these directories are scanned. Artifacts with path "external:*"
-# (managed by Execute-LandingPrompt) are implicitly skipped because they don't
-# reside in any of these directories. If external artifact paths are ever changed
-# to relative paths within these dirs, explicit skip logic must be added here.
+# NOTE: Only these directories are scanned. This allow-list IS the contract
+# referenced by PST SKILL.md §10 (scan_changes Path Scope). Status/, views/,
+# AGENTS.md, tools/, templates/, outputs/, and any other repo-top-level paths
+# are implicitly excluded. Artifacts with path "external:*" (managed by
+# Execute-LandingPrompt) are implicitly skipped because they don't reside
+# in any of these directories. Updates here MUST update PST §10.
 SCANNED_DIRS = [
     ("research", "research"),
     ("decisions", "decision"),

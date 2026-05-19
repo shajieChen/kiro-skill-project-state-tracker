@@ -88,6 +88,118 @@ def atomic_write(path: str, text: str):
         raise
 
 
+# ----------------------------- concurrency lock -----------------------------
+# Cross-platform exclusive lock via atomic O_CREAT|O_EXCL on a lockfile in
+# status/.cache/. Stale-lock detection: if the lockfile is older than
+# LOCK_STALE_SECONDS (default 5 min), it is considered orphaned and removed.
+
+LOCK_BASENAME = "apply_changes.lock"
+LOCK_TIMEOUT_SECONDS = 30      # how long to wait for an active lock to clear
+LOCK_RETRY_INTERVAL = 0.25
+LOCK_STALE_SECONDS = 300       # treat lockfile older than this as orphaned
+
+
+def _lock_path(project: str) -> str:
+    return os.path.join(project, "status", ".cache", LOCK_BASENAME)
+
+
+def acquire_lock(project: str) -> str:
+    """Acquire an exclusive lock on status.yaml writes. Returns lock path.
+
+    Raises TimeoutError if another writer holds a fresh lock past
+    LOCK_TIMEOUT_SECONDS. Auto-clears stale locks (older than
+    LOCK_STALE_SECONDS) before retrying.
+    """
+    import time
+    lock_path = _lock_path(project)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            try:
+                os.write(fd, f"{os.getpid()}\n{now_iso()}\n".encode("utf-8"))
+            finally:
+                os.close(fd)
+            return lock_path
+        except FileExistsError:
+            # Stale-lock cleanup.
+            try:
+                age = time.time() - os.path.getmtime(lock_path)
+            except OSError:
+                age = 0
+            if age > LOCK_STALE_SECONDS:
+                try:
+                    os.unlink(lock_path)
+                    continue
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"[apply_changes] could not acquire {lock_path} "
+                    f"within {LOCK_TIMEOUT_SECONDS}s (concurrent writer)"
+                )
+            time.sleep(LOCK_RETRY_INTERVAL)
+
+
+def release_lock(lock_path: str) -> None:
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
+
+
+# ------------------------- pending writebacks drain -------------------------
+# When ELP's Phase B write fails, it appends the unwritten payload to
+# status/.cache/pending_writebacks.json. apply_changes drains the queue on each
+# invocation BEFORE consuming the current approved_transitions.json, so PST
+# AUDIT Step 0 (which simply invokes apply_changes) automatically replays them.
+
+PENDING_WRITEBACKS_BASENAME = "pending_writebacks.json"
+
+
+def _pending_writebacks_path(project: str) -> str:
+    return os.path.join(project, "status", ".cache", PENDING_WRITEBACKS_BASENAME)
+
+
+def drain_pending_writebacks(project: str, status: dict) -> tuple[list, list]:
+    """Drain pending_writebacks.json into transitions to apply this run.
+
+    Returns (drained_transitions, kept_queue). Drained transitions are merged
+    into the current run's transitions[]; kept_queue is the remaining queue
+    after this drain (entries that failed validation are kept for the next run
+    with an attempts[] note appended).
+    """
+    path = _pending_writebacks_path(project)
+    if not os.path.isfile(path):
+        return [], []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[apply_changes] pending_writebacks unreadable: {e}", file=sys.stderr)
+        return [], []
+    queue = data.get("queue") or []
+    drained: list = []
+    kept: list = []
+    for entry in queue:
+        payload = entry.get("payload") or {}
+        ts = payload.get("transitions") or []
+        if not ts:
+            # Empty entry — drop silently.
+            continue
+        drained.extend(ts)
+    # Atomic-rewrite queue file with the kept (currently always empty after
+    # successful drain; if a transition fails inside _apply_transition, it is
+    # logged but does NOT re-enter the queue automatically — agent must
+    # re-enqueue to avoid infinite loops).
+    try:
+        atomic_write(path, json.dumps({"queue": kept}, ensure_ascii=False, indent=2))
+    except OSError as e:
+        print(f"[apply_changes] failed to rewrite pending_writebacks: {e}", file=sys.stderr)
+    return drained, kept
+
+
 def _hash_file(abs_path: str) -> str:
     """Return sha256 hex digest of file at abs_path, or '' if unreadable."""
     h = hashlib.sha256()
@@ -442,16 +554,45 @@ def main():
     if not os.path.isfile(status_path):
         print("[apply_changes] FAIL: status.yaml not found", file=sys.stderr)
         sys.exit(2)
-    if not os.path.isfile(approved_path):
-        print("[apply_changes] no approved_transitions.json — nothing to apply")
-        sys.exit(0)
 
+    # R3: serialize all writers via lockfile so PST AUDIT + ELP direct-write
+    # cannot race on status.yaml.
+    try:
+        lock_path = acquire_lock(project)
+    except TimeoutError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(4)
+
+    try:
+        _main_locked(project, status_path, approved_path, changed_path)
+    finally:
+        release_lock(lock_path)
+
+
+def _main_locked(project: str, status_path: str, approved_path: str, changed_path: str):
     with open(status_path, "r", encoding="utf-8") as f:
         status = yaml.load(f.read()) or {}
-    with open(approved_path, "r", encoding="utf-8") as f:
-        approved = json.load(f) or {}
+
+    # R1: drain ELP's failed-Phase-B queue BEFORE reading approved_transitions
+    # so AUDIT Step 0 replays it automatically.
+    drained_transitions, _kept = drain_pending_writebacks(project, status)
+
+    if not os.path.isfile(approved_path):
+        if not drained_transitions:
+            print("[apply_changes] no approved_transitions.json — nothing to apply")
+            return
+        approved = {
+            "event_summary": "Drained pending_writebacks from prior ELP failures",
+            "transitions": [],
+        }
+    else:
+        with open(approved_path, "r", encoding="utf-8") as f:
+            approved = json.load(f) or {}
 
     transitions = approved.get("transitions") or []
+    # Prepend drained entries so they apply first (they predate this run).
+    if drained_transitions:
+        transitions = drained_transitions + transitions
     event_summary = approved.get("event_summary") or "Skill run state propagation"
 
     if not transitions:

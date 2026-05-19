@@ -23,7 +23,13 @@ Companion reference: Part C of this document — load sections on-demand per §6
 
 **Execution recovery:** Check `status/.cache/` for partial artifacts. Resume, never restart.
 
-**Confidence gating:** <80% confidence → `requires_agent_review: true`. Never auto-apply uncertain transitions.
+**Confidence gating (single source of truth — referenced by §4 Step 4):**
+
+| Confidence | Action | Marker |
+|---|---|---|
+| ≥ 90% | auto-apply | — |
+| 60–89% | apply with `requires_agent_review: true` | flag |
+| < 60% | hold; report in §5 "Recommended Next Actions" | — |
 
 **Small-project fast path (≤5 artifacts, no handoff_contexts):**
 - Skip §6C, §6F, §8
@@ -131,7 +137,7 @@ The §3C branch handles the common case where Execute-LandingPrompt has scaffold
 Triggered when `status.yaml` exists but `tools/` and/or `views/` are missing — typically ELP-bootstrapped workspace needing infrastructure catch-up. **Directory/tool catch-up only — never re-infers dependencies, never mutates artifact records.**
 
 1. Create missing dirs (idempotent): `tools/`, `views/`, `status/.cache/`, `prompts/landing/`, `prompts/test/`, `research/`, `decisions/`, `plan/`, `outputs/`
-2. Install Python tool set into `tools/` from PST skill's `templates/tools/`. Idempotent reinstall acceptable only if hashes match the template; otherwise leave user-modified files alone and warn.
+2. Install Python tool set into `tools/` from PST skill's own `tools/` directory (canonical source — the previous `templates/tools/` mirror was removed in 2026-05 to eliminate the three-copy sync burden). Idempotent reinstall acceptable only if hashes match the canonical source; otherwise leave user-modified files alone and warn.
 3. Read-only `validate_status.py` — report failures, do NOT auto-fix
 4. `render_status.py` — render views + READMEs
 5. Emit report (§5). In `## Processing Summary` note: "Completed scaffold from partial workspace (likely Execute-LandingPrompt bootstrap)"
@@ -146,14 +152,16 @@ Each step declares Input/Output/Fail contracts. Step 4 is the ONLY step requirin
 
 | Step | Action | Input | Output | Fail |
 |------|--------|-------|--------|------|
-| 0 | `scan_changes.py` (dirty probe — same script subsumes legacy dirty_check; inspect `changes[]` count) | project path | `{status, dirty_files[]}` | `"error"` → fall through to §3 |
-| 1 | `scan_changes.py` | project path | `changed_files.json` | empty → skip to Step 7 |
+| 0 | **Drain `pending_writebacks.json`** (see §9) → `scan_changes.py` (dirty probe; inspect `changes[]` count) | project path | `{status, dirty_files[]}` | scan `"error"` → `status.yaml` likely missing/corrupt; abort AUDIT, route to §3 INIT family |
+| 1 | `scan_changes.py` | project path | `changed_files.json` | empty AND no drained writebacks AND `status.yaml` mtime unchanged since last AUDIT → fast-exit (skip to Step 7 render-skip check) |
 | 2 | Re-extract metadata | changed_files + sources | updated artifact records | parse error → `requires_agent_review: true` |
+| 2.5 | **Incremental PC generation** (§6C) — scan artifacts for LPs missing PCs and append; covers PSS-added LPs | status.yaml | updated `preconditions[]` + Gate G-001 if needed | — |
+| 2.6 | **Pending-consumers backfill** (§6F) — scan every HC's `pending_consumers[]`; for each token resolvable against current `artifacts[].id`, move it to `consumed_by[]` and add a `consumed_status` `{consumer, status: pending, consumed_version: null, consumed_at: null}` row. Tokens that still do not resolve stay in `pending_consumers[]` for a future cycle. Never delete an entry that did not resolve. | status.yaml | updated `handoff_contexts[*].consumed_by` and `consumed_status` | — |
 | 3 | `propagate.py` | changed_files + status.yaml | `candidate_transitions.json` | no candidates → skip to Step 6 |
 | 4 | **Agent reviews candidates** | candidates JSON | `approved_transitions.json` | <80% confidence → hold candidate |
 | 5 | `apply_changes.py` | approved_transitions | updated status.yaml | write error → abort, report in §5 |
 | 6 | `validate_status.py` | status.yaml | `{passed[], failed[], warnings[], score}` | — (always produces output) |
-| 7 | `render_status.py` | status.yaml | views/* + AGENTS.md + READMEs | — |
+| 7 | `render_status.py` | status.yaml | views/* + AGENTS.md + READMEs | skip if (no transitions applied AND views/ mtime ≥ status.yaml mtime) — render is pure function, re-running is wasted I/O |
 | 8 | Emit report (§5 format) | all above outputs | formatted markdown | — |
 
 ### Step 4 Decision Protocol
@@ -162,7 +170,7 @@ For each candidate transition:
 1. Is the `from` status correct? (verify against status.yaml)
 2. Is the `to` status a valid state machine transition?
 3. Is the `reason` accurate? (verify the claimed change actually occurred)
-4. Confidence: high → auto-approve, medium → approve with flag, low → hold
+4. Confidence per §0 gating table (≥90 auto / 60–89 flag / <60 hold).
 
 **Semantic hash optimization:** Compare extracted metadata against previous snapshot. If file touched but metadata unchanged (cosmetic edit), skip downstream propagation.
 
@@ -242,6 +250,11 @@ Load matching Part C subsection ONLY when executing its step; discard after. §6
 
 **README generation contract** (rest of mechanics live in `render_status.py` docstring):
 - `prompts/landing/README.md`: preserve existing front-matter and any user-edited `## LP 序列` (user intent wins over inferred topo sort).
+- **LP-sequence-source guard** (closes drift gap): front-matter carries `lp_sequence_source: "user" | "auto"`.
+  - PSS / first scaffold writes `"auto"`.
+  - ANY hand-edit to `## LP 序列` by a human (detected via PST-stored sha256 of the last auto-written body vs current body) flips it to `"user"` on next render.
+  - `render_status.py` MUST refuse to overwrite `## LP 序列` when `lp_sequence_source == "user"` — only update other body sections. When `"auto"`, regenerate from topo sort and write back the new body hash to `status/.cache/lp_sequence_hash.txt`.
+  - If front-matter lacks the marker (legacy READMEs), treat as `"user"` (fail-safe: never silently overwrite).
 - `## LP 序列` auto-format: tokens chained by ` -> ` (single line or multi-line; ELP flattens). Bullets/commas NOT accepted.
 - `## Coding Standards` is the canonical write target — `render_status.py` writes `meta.coding_standards` into the body ONLY, never into front-matter.
 - If `meta.source_root` is missing, front-matter is marked `"<未配置>"` — ELP refuses to execute until configured.
@@ -258,178 +271,78 @@ Persist to `status/.cache/session_memory.json`:
 
 Next AUDIT: skip unchanged files; re-present pending suggestions. Delete on INIT or "full check".
 
-
----
 ---
 
-# Companion Reference
+## §9 Pending Writebacks Drain (Phase B failure recovery)
 
-> Load sections on-demand per §6 pointer table. Discard after the step completes.
-> Step 4 confidence thresholds: high ≥90% auto-approve; medium 60–89% approve+flag; low <60% hold (report in §5 "Recommended Next Actions").
-> Step 2 failure: never skip a changed file — produce a partial record with `requires_agent_review: true`.
+**Purpose:** Close the silent-divergence gap when Execute-LandingPrompt's Phase B write fails (transient I/O, lock contention, schema error). The unwritten transitions are persisted to `status/.cache/pending_writebacks.json` instead of being lost.
 
-## Part C: §6 Reference Rules (Full Text)
+**File contract (`status/.cache/pending_writebacks.json`):**
 
-### §6A ID & Title Extraction
-
-**ID** (first match wins):
-1. Filename pattern: `R-001-*.md` → `R-001`, `D-001-*.yaml` → `D-001`, `LP-001-*.md` → `LP-001`, `TP-001-*.md` → `TP-001`
-2. YAML front-matter `id:` field
-3. H1 with prefix: `# R-001: Title` → `R-001`; `# Plan.<topic>: Title` → `Plan.<topic>` (project-state-spec convention)
-4. Fallback: slugify → `Plan.<stem>`, `LP.<stem>`, `TP.<stem>`
-
-**Title** (first match): YAML `title:` → H1 text → humanized filename
-
-**Type** from directory: research/ → research_finding, decisions/ → decision, plan/ → plan, prompts/landing/ → landing_prompt, prompts/test/ → test_prompt
-
-**External artifacts** (path starts with `external:`): These are managed by Execute-LandingPrompt. Their IDs follow the same resolution order above. During AUDIT, skip file-based checks for external artifacts — trust the last ELP-authored change_event as ground truth.
-
-### §6B Dependency Inference (4-Step Process)
-
-**Step A — Reference Scan:** Find artifact IDs in body text.
-- Patterns: `R-\d{3}`, `D-\d{3}`, `Plan\.\w+`, `LP-\d{3}`, `TP-\d{3}`, `HC-\d{3}`
-
-**Step B — Semantic Markers:** Keywords near IDs:
-- "based on R-001" → depends_on
-- "implements D-002" → depends_on
-- "invalidates A-001" → invalidates
-- "affects Plan.*" → affects
-- "requires LP-001 output" → consumes_handoffs
-
-**Step C — Structural Inference** (no explicit markers):
-- Decision→R-* = based_on; Plan→D-* = depends_on; LP→Plan.* = depends_on; TP→LP-* = depends_on
-
-**Step D — Confidence Scoring:**
-- Explicit semantic marker = high → auto-register
-- ID in body, no marker = medium → `requires_agent_review: true`
-- Structural only = low → suggest in report only
-
-### §6C Precondition Generation
-
-Per LP:
-- Each upstream Plan P → PC: `P.status ∈ [approved, ready]`
-- Each downstream TP → PC: `TP.status ∈ [ready]`
-- Each consumed HC → PC: `HC.status ∈ [available, consumed], version ≥ 1`
-
-Generate Gate G-001 if any LP has PCs. Sequential IDs: PC-001, PC-002...
-Do NOT regenerate existing PCs in AUDIT mode.
-
-### §6F Handoff Context Management
-
-When LP referenced downstream and no HC exists:
-- Suggest: `{id: HC-<next>, producer: LP.id, status: draft}`
-- Extract facts: bullets under Summary/Output/Results (max 3)
-- Extract constraints: sentences with "must not"/"required"/"constraint" (max 3)
-- Set consumed_by from downstream depends_on
-- Mark `requires_agent_review: true`
-
-Never auto-bump HC versions — EXCEPT when Execute-LandingPrompt writes a HC update with actually-changed facts/constraints content (verified by content diff, not just re-execution).
-
-**ELP-authored HCs:** When `source: Execute-LandingPrompt` in the change_event that created/updated an HC, treat the HC as validated (ELP extracted facts from actual execution). Do not mark `requires_agent_review`.
-
-### §6G status.yaml Schema
-
-This schema reflects what PST tools actually read and write. When tools and this schema disagree, **tools are the truth**. Block authority lives at the end of this section.
-
-```yaml
-meta:
-  project_name: string
-  schema_version: int
-  created: ISO
-  last_updated: ISO
-  last_run: ISO
-  total_artifacts: int
-  total_research: int
-  total_blockers: int
-  hotspots: []
-  source_root: string                    # optional
-  scope: string[]                        # optional
-  pst_root: string                       # optional
-  coding_standards: string               # optional → ## Coding Standards body
-  summary:
-    artifacts_total: int
-    artifacts_ready: int
-    artifacts_blocked: int
-    artifacts_needs_update: int
-    blockers_open: int
-    gates_failed: int
-    handoffs_total: int
-    handoffs_stale: int
-    handoffs_invalidated: int
-    handoffs_pending_consumers: int
-  pointers:
-    entry_point: string                  # typically "AGENTS.md"
-    views_dir: string                    # typically "views/"
-    status_report: string
-    handoff_view: string
-    prompt_chain: string
-
-project:
-  name: string
-  phase: string                          # e.g. "execution"
-  version: string
-
-artifacts: [{id, type, path, status, depends_on[], produces_handoffs?[], consumes_handoffs?[], last_checked?}]
-research_findings: [{id, title, path, status, evidence?[], affects?[]}]
-decisions: [{id, title, path, status, based_on[], rejects?[], affects?[]}]
-blockers: [{id, title, severity, status, blocks[]}]
-gates: [{id, name, status, checks[{id, description, status}]}]
-preconditions: [{id, target, requires[{artifact|handoff, field, condition}], status}]
-handoff_contexts:
-  - id: string                           # e.g. "HC-001"
-    title: string                        # optional
-    producer: string                     # artifact id
-    producer_type: string                # optional, e.g. "landing_prompt"
-    produced_from: string[]              # optional
-    version: int
-    status: string                       # available | stale | invalidated | consumed
-    results: []                          # optional
-    invalidated_by: []                   # optional
-    facts: []                            # structured {id, statement, source, confidence} OR legacy string
-    constraints: []                      # structured {id, statement, source} OR legacy string
-    consumed_by: string[]
-    consumed_status:
-      - consumer: string                 # artifact id
-        status: string                   # pending | consumed | stale
-        consumed_version: int | null
-        consumed_at: ISO | null
-    last_verified: ISO                   # optional
-change_events:
-  - id: string                           # e.g. "CE-001"
-    time: ISO
-    source: string                       # e.g. "Execute-LandingPrompt", "project-state-tracker"
-    event_type: string                   # e.g. "lp_execution", "scaffold_and_execute"
-    summary: string                      # optional
-    affected: string[]                   # artifact ids
-    transitions:
-      - artifact: string
-        from: string | null
-        to: string
-        reason: string
-
-evidence: []                             # placeholder list
-assumptions: []                          # placeholder list
-dependencies: []                         # placeholder list (NOT artifacts[].depends_on)
-
-rules:
-  research_is_fact_only: bool
-  status_is_single_source_of_truth: bool
-  landing_requires_test_ready: bool
-  plan_invalidates_landing: bool
-  landing_invalidates_test: bool
-
-snapshots:
-  enabled: bool                          # REQUIRED by validate_status.py
-  git_baseline: string | null
-  file_hashes: {path: sha256}
+```json
+{
+  "queue": [
+    {
+      "enqueued_at": "ISO",
+      "source": "Execute-LandingPrompt",
+      "lp_file": "<absolute LP path>",
+      "reason": "<short failure cause>",
+      "payload": { /* same shape as approved_transitions.json */ }
+    }
+  ]
+}
 ```
 
-**Block authority:**
-- `validate_status.py` — authoritative consumer for `project`, `rules`, `evidence`, `assumptions`, `dependencies`, `snapshots`.
-- `render_status.py` — authoritative consumer for `meta.summary` and `meta.pointers`.
-- `apply_changes.py` — authoritative writer for `artifacts`, `handoff_contexts`, `change_events`.
-- ELP — authoritative writer for `meta.source_root`, `meta.scope`, `meta.pst_root`, `meta.coding_standards`.
+ELP appends to `queue[]` on Phase B failure (see ELP `§ Error Handling`). Writers must use atomic write (write to `.tmp` then rename).
 
-If you add a new block, update both this schema section and the consuming tool — they must move together.
+**AUDIT Step 0 drain algorithm:**
 
-**Legacy compatibility (facts/constraints):** `handoff_contexts[].facts` / `.constraints` accept BOTH structured dict `{id, statement, source, confidence?}` AND legacy bare-string format. PST tools MUST guard with `isinstance(x, dict)` before `.get()`. ELP v3+ always writes structured.
+1. If `pending_writebacks.json` does not exist or `queue[]` is empty → no-op, continue.
+2. For each `queue[i]`:
+   - Copy `payload` to `status/.cache/approved_transitions.json`.
+   - Invoke `python tools/apply_changes.py --project <p>`.
+   - On success: remove the entry from `queue[]`.
+   - On failure: leave entry in `queue[]`, record reason in `attempts[]`, abort drain, surface in §5 report.
+3. After successful drain, atomic-rewrite `pending_writebacks.json` with empty `queue`.
+
+**INIT (§3) interaction:** §3A and §3C MUST drain `pending_writebacks.json` before any artifact inference. §3B (truly empty) leaves the file untouched.
+
+---
+
+## §10 scan_changes Path Scope (declaration)
+
+`scan_changes.py` SCANS only the artifact directories: `research/`, `decisions/`, `plan/`, `prompts/landing/`, `prompts/test/`.
+
+`scan_changes.py` MUST IGNORE (never report as dirty):
+- `status/**` (state + cache + lock files)
+- `views/**` (regenerated by render_status.py)
+- `AGENTS.md`, `README.md`, `prompts/landing/README.md`, `prompts/test/README.md` (regenerated)
+- `tools/**` (skill-managed)
+- `outputs/**` (LP execution artifacts — never source)
+- Any file whose `path` in `artifacts[]` starts with `external:` (agent-managed, not on disk)
+
+This is already enforced by the SCANNED_DIRS allow-list inside `scan_changes.py`; this section is the contract for agents and future maintainers.
+
+
+---
+---
+
+# Companion Reference (external)
+
+Detailed reference rules (§6A ID extraction, §6B dependency inference, §6C precondition generation, §6F handoff management, §6G schema) live in a sibling file to keep this prompt small. **Load on demand:**
+
+```
+view C:\Users\chenshajie\.kiro\skills\project-state-tracker\companion.md
+```
+
+Load WHEN:
+- §6A / §6B → Step 2 (re-extract metadata)
+- §6C       → Step 4 (LP candidates present)
+- §6F       → Step 4 (HC candidates present)
+- §6G       → on validation error only
+
+Discard from working memory once the matching step completes.
+
+> Step 4 confidence thresholds → see §0 gating table (single source of truth).
+> Step 2 failure: never skip a changed file — produce a partial record with `requires_agent_review: true`.
+
