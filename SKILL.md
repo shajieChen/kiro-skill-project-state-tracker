@@ -54,12 +54,14 @@ Any non-terminal → invalidated | deprecated | archived
 
 **External executor privilege (Execute-LandingPrompt):**
 
-ELP is a trusted external executor that writes status.yaml directly (or via apply_changes.py when available). Its writes are valid because ELP IS the reviewer+approver+executor for LP artifacts. Specific accommodations:
+ELP is a trusted external executor that writes status.yaml directly (or via apply_changes.py when available) — it is reviewer+approver+executor for LP artifacts in one. Concrete accommodations:
 
-- ELP may transition LP artifacts: `ready → ready`, `ready → needs_update`, `ready → blocked`, `needs_update → ready`, `blocked → ready`. These collapse the `needs_update → draft → reviewed → approved → ready` chain because ELP performs all intermediate steps atomically.
-- Artifacts with `path: "external:*"` are "agent-managed" — scan_changes (which subsumes the legacy dirty_check role) skips them. Only ELP (or manual user action) can transition their state.
-- When AUDIT Step 4 encounters a transition authored by `source: Execute-LandingPrompt`, auto-approve at high confidence (ELP is a trusted source).
-- ELP-authored transitions are NOT state-machine-validated by `apply_changes.py`. ELP is contractually responsible for emitting only transitions in the whitelist above. PST AUDIT Step 4 acts as a second-line reviewer that may flag (but typically auto-approves) ELP writes.
+| Aspect | Rule |
+|---|---|
+| Whitelisted LP transitions | `ready→ready`, `ready→needs_update`, `ready→blocked`, `needs_update→ready`, `blocked→ready` (collapses the `needs_update→draft→reviewed→approved→ready` chain — ELP performs all intermediate steps atomically) |
+| `path: "external:*"` artifacts | scan_changes (subsumes legacy dirty_check) skips them; only ELP or manual user action transitions their state |
+| AUDIT Step 4 vs `source: Execute-LandingPrompt` | auto-approve at high confidence (trusted source); PST is second-line reviewer |
+| State-machine validation | NOT enforced by `apply_changes.py` on ELP writes — ELP is contractually responsible for emitting only whitelisted transitions |
 
 ---
 
@@ -90,13 +92,15 @@ The §3C branch handles the common case where Execute-LandingPrompt has scaffold
 | "create handoff for LP-*" | §4 | Generate HC for specified LP |
 | "check handoff status" | — | Render handoff_view |
 
+**Note on "init" routing:** User-typed "init" routes to the §3 family, but the specific sub-mode (§3A / §3B / §3C) is still chosen by the existence checks at the top of this section. In particular, "init" against an ELP-scaffolded workspace (status.yaml exists, tools/views missing) resolves to **§3C INIT_COMPLETE_SCAFFOLD**, NOT §3A. This preserves the ELP-authored artifact records — §3A's full re-inference is reserved for true greenfield projects with no prior status.yaml.
+
 ---
 
 ## §3 INIT Mode
 
 ### §3A INIT_FROM_DOCS
 
-1. Scaffold: `status/`, `status/.cache/`, `views/`, `tools/`, `prompts/landing/`, `prompts/test/`
+1. Scaffold: `status/`, `status/.cache/`, `views/`, `tools/`, `prompts/landing/`, `prompts/test/`, `research/`, `decisions/`, `plan/`, `outputs/`
 2. Scan ALL tracked files → extract ID + title + type (load companion §6A)
 3. Infer dependencies from content (load companion §6B) — full content read, all phases
 4. Generate preconditions for LPs (load companion §6C) — skip if no LPs
@@ -113,18 +117,15 @@ The §3C branch handles the common case where Execute-LandingPrompt has scaffold
 
 ### §3C INIT_COMPLETE_SCAFFOLD
 
-Triggered when `status.yaml` exists but `tools/` and/or `views/` are missing — typically because Execute-LandingPrompt bootstrapped a minimal workspace and now needs PST to complete the infrastructure. This mode is **directory/tool catch-up only** — it never re-infers dependencies and never mutates existing artifact records.
+Triggered when `status.yaml` exists but `tools/` and/or `views/` are missing — typically ELP-bootstrapped workspace needing infrastructure catch-up. **Directory/tool catch-up only — never re-infers dependencies, never mutates artifact records.**
 
-1. Create missing directories: `tools/`, `views/`, `status/.cache/`, `prompts/landing/`, `prompts/test/` (idempotent — skip any that already exist)
-2. Write the Python tool set into `tools/` from the PST skill's `templates/tools/` source (same set as §3A scaffold step 1)
-3. Read-only shape validation: `python tools/validate_status.py --project <p>` — report any failures but do NOT auto-fix; report-only
-4. Render views + READMEs: `python tools/render_status.py --project <p>`
-5. Emit report (§5) — in `## Processing Summary` explicitly note: "Completed scaffold from partial workspace (likely Execute-LandingPrompt bootstrap)" so the user knows the prior state
+1. Create missing dirs (idempotent): `tools/`, `views/`, `status/.cache/`, `prompts/landing/`, `prompts/test/`, `research/`, `decisions/`, `plan/`, `outputs/`
+2. Install Python tool set into `tools/` from PST skill's `templates/tools/`. Idempotent reinstall acceptable only if hashes match the template; otherwise leave user-modified files alone and warn.
+3. Read-only `validate_status.py` — report failures, do NOT auto-fix
+4. `render_status.py` — render views + READMEs
+5. Emit report (§5). In `## Processing Summary` note: "Completed scaffold from partial workspace (likely Execute-LandingPrompt bootstrap)"
 
-**Constraints:**
-- Do NOT re-infer dependencies. Do NOT run `propagate.py`. Do NOT modify any artifact record in `status.yaml`.
-- Do NOT delete or overwrite any existing tool file (idempotent reinstall is acceptable only if hashes match the template; otherwise leave user-modified files alone and warn in the report).
-- The next user-invoked `Skill project-state-tracker + audit` will route normally to §4.
+**Forbidden in §3C:** re-infer dependencies, run `propagate.py`, modify any artifact record. Next user-invoked audit will route normally to §4.
 
 ---
 
@@ -192,18 +193,15 @@ Quality: ✓ N passed / ✗ N failed / ⚠ N warnings
 
 ## §6 Reference Rules — Demand-Paged
 
-Load subsection from companion ONLY when executing the matching step.
-Discard from working memory after step completes.
+Load matching Part C subsection ONLY when executing its step; discard after. §6D/§6E live in Python tools — never load.
 
-| Subsection | Load WHEN | Discard WHEN | Priority |
-|------------|-----------|--------------|----------|
-| §6A ID Extraction | Step 2 (re-extract metadata) | Step 2 done | high |
-| §6B Dependency Inference | Step 2 (new files only) | Step 3 starts | high |
-| §6C Precondition Gen | Step 4 (LP candidates present) | Step 4 done | medium |
-| §6D Propagation Rules | NEVER (in propagate.py) | — | — |
-| §6E Quality Checklist | NEVER (in validate_status.py) | — | — |
-| §6F Handoff Management | Step 4 (HC candidates present) | Step 4 done | low |
-| §6G Schema Reference | On validation error only | Error resolved | low |
+| Subsection | Load WHEN | Priority |
+|------------|-----------|----------|
+| §6A ID Extraction | Step 2 (re-extract metadata) | high |
+| §6B Dependency Inference | Step 2 (new files only) | high |
+| §6C Precondition Gen | Step 4 (LP candidates present) | medium |
+| §6F Handoff Management | Step 4 (HC candidates present) | low |
+| §6G Schema Reference | On validation error only | low |
 
 ---
 
@@ -220,28 +218,22 @@ Discard from working memory after step completes.
 | Quality (≤3 artifacts) | — | manual |
 | Quality (>3) | validate_status.py | — |
 
-**DO:** Preserve user fields; record all changes in change_events; `requires_agent_review: true` for <80% confidence; PCs for every LP; tools for mechanical work; sequential IDs; trust ELP-authored transitions (source: Execute-LandingPrompt) as high-confidence.
+**DO:** Preserve user fields; record all changes in change_events; tools for mechanical work; sequential IDs.
+(Other DO items are already covered: confidence flagging in §4, PC generation in §6C, ELP trust in §1.)
 
-**DON'T:** Copy body text into status.yaml; set "ready" without preconditions passing; edit user files; propagate beyond graph; treat views/ as truth; auto-bump HC versions (ELP may bump only when content changes); edit status.yaml directly (except ELP in scaffold-only workspaces).
+**DON'T:** Copy body text into status.yaml; edit user files; propagate beyond graph; treat views/ as truth; auto-bump HC versions (ELP may bump only when content changes); edit status.yaml directly (except ELP in scaffold-only workspaces).
 
-**ELP "ready" exception (explicit invariant):** ELP MAY set status to `ready` ONLY when its Dependency Gate result is `passed` (preconditions verified before execution). On `forced override` or `verify-only override`, ELP MUST map the artifact to `needs_update`, even if Phase A succeeded — the "ready requires PCs passed" invariant must hold. This invariant is enforced by ELP itself; `apply_changes.py` does not validate it.
+**ELP "ready" exception (explicit invariant):** ELP MAY set status to `ready` ONLY when its Dependency Gate result is `passed`. On forced/verify-only override, ELP MUST map to `needs_update` even if Phase A succeeded — the "ready requires PCs passed" invariant must hold. Enforced by ELP itself; `apply_changes.py` does not validate it.
 
-**meta schema extensions (for README generation):**
-- `source_root`: string, optional — source code root directory for ELP
-- `scope`: string[], optional — allowed operation paths for ELP
-- `pst_root`: string, optional — PST management root (defaults to status.yaml parent)
-- `coding_standards`: string, optional — coding conventions for ELP to follow
+**meta schema extensions (for README generation):** `source_root`, `scope`, `pst_root`, `coding_standards` — all optional strings (scope is string[]), written by ELP from README, consumed by `render_status.py` to regenerate:
+1. `<pst_root>/README.md` — project overview (full overwrite)
+2. `<pst_root>/prompts/landing/README.md` — ELP-compatible README (front-matter + `## LP 序列` + `## Coding Standards` body)
 
-These fields are read by `render_status.py` to generate:
-1. `<pst_root>/README.md` — full project state overview (目录树 + artifact 表 + 依赖图 + handoff + blockers + 快速导航)
-2. `<pst_root>/prompts/landing/README.md` — ELP-compatible README (front-matter + LP 序列 + Coding Standards + LP 状态 + HC 摘要)
-
-**README generation rules:**
-- `README.md` is always overwritten (auto-generated, not user-authored)
-- `prompts/landing/README.md` preserves existing YAML front-matter if user has hand-edited it; only the body is regenerated
-- `prompts/landing/README.md` preserves existing `## LP 序列` section if it differs from the auto-generated topological sort (user-authored execution order takes priority over inferred order)
-- Both READMEs are rendered by `render_status.py` in Step 7 alongside views and AGENTS.md
-- If `meta.source_root` is missing, front-matter marks it as `"<未配置>"` — ELP will refuse to execute until a valid source_root is configured
+**README generation contract** (rest of mechanics live in `render_status.py` docstring):
+- `prompts/landing/README.md`: preserve existing front-matter and any user-edited `## LP 序列` (user intent wins over inferred topo sort).
+- `## LP 序列` auto-format: tokens chained by ` -> ` (single line or multi-line; ELP flattens). Bullets/commas NOT accepted.
+- `## Coding Standards` is the canonical write target — `render_status.py` writes `meta.coding_standards` into the body ONLY, never into front-matter.
+- If `meta.source_root` is missing, front-matter is marked `"<未配置>"` — ELP refuses to execute until configured.
 
 ---
 
@@ -261,79 +253,9 @@ Next AUDIT: skip unchanged files; re-present pending suggestions. Delete on INIT
 
 # Companion Reference
 
-> Load sections on-demand per the pointer table in the core prompt §6.
-> Discard from working memory after the corresponding step completes.
-
----
-
-## Part A: SCL Phase Contracts
-
-### Step 2: Metadata Re-extraction
-
-**Input contract:**
-- `changed_files.json` (from scan_changes.py): `{changes: [{path, classification, change_type}]}`
-- Source files on disk (for reading content)
-
-**Output contract:**
-- Updated artifact records with fields: `{id, title, type, path, depends_on[], status}`
-- Each record must have all 5 fields populated
-
-**Failure modes:**
-- Parse error reading source file → set `requires_agent_review: true` on that artifact
-- ID extraction fails (no pattern match) → use fallback slugify: `<Type>.<filename_stem>`
-- Dependency inference ambiguous → register with confidence=medium
-
-**Recovery:** Never skip a changed file. Always produce a record, even if partial.
-
-### Step 4: Agent Review Protocol
-
-**Input contract:**
-- `candidate_transitions.json`: `{candidates: [{artifact, from, to, reason, requires_agent_review}]}`
-- Current `status.yaml` for verification
-
-**Decision criteria per candidate:**
-1. Verify `from` matches current status in status.yaml
-2. Verify `to` is a valid state machine transition
-3. Verify `reason` — the claimed change actually occurred in the file
-4. Assess confidence: high → auto-approve; medium → approve with flag; low → hold
-
-**Confidence thresholds:**
-- High (≥90%): Explicit marker found, valid transition, reason verified
-- Medium (60-89%): Structural inference only, or reason partially verified
-- Low (<60%): No evidence found, or conflicting signals
-
-**Output contract:**
-- `approved_transitions.json`: `{transitions: [{artifact, from, to, reason, confidence}]}`
-- Held candidates reported in §5 output under "Recommended Next Actions"
-
----
-
-## Part B: Demand Paging Rules
-
-### Loading Protocol
-
-1. Read current pipeline step number from execution context
-2. Consult §6 pointer table in core prompt for matching subsection
-3. Load the matching Part C subsection into working memory
-4. Execute the step using loaded reference
-5. After step completes, mark section as "discardable"
-6. On next step, discard previous section (unless still needed)
-
-### Priority Matrix
-
-| Token budget remaining | Load policy |
-|------------------------|-------------|
-| ≤2000 tokens | High-priority sections ONLY |
-| 2001–4000 tokens | High + medium priority |
-| >4000 tokens | Load as needed by step |
-
-### Conflict Resolution
-
-- Two sections needed simultaneously → load higher priority first
-- Section already loaded from previous step → retain (zero reload cost)
-- Section marked "NEVER load" (§6D, §6E) → always skip, Python handles these
-
----
+> Load sections on-demand per §6 pointer table. Discard after the step completes.
+> Step 4 confidence thresholds: high ≥90% auto-approve; medium 60–89% approve+flag; low <60% hold (report in §5 "Recommended Next Actions").
+> Step 2 failure: never skip a changed file — produce a partial record with `requires_agent_review: true`.
 
 ## Part C: §6 Reference Rules (Full Text)
 
@@ -394,32 +316,26 @@ Never auto-bump HC versions — EXCEPT when Execute-LandingPrompt writes a HC up
 
 **ELP-authored HCs:** When `source: Execute-LandingPrompt` in the change_event that created/updated an HC, treat the HC as validated (ELP extracted facts from actual execution). Do not mark `requires_agent_review`.
 
-**Facts/Constraints format compatibility:** HC facts and constraints support two formats:
-- **Structured (preferred):** `{id: "F-001", statement: "...", source: "...", confidence: "high"}`
-- **Legacy (string):** `"plain text string"`
-
-ELP v3+ always writes structured format. PST tools (render_status.py, propagate.py) MUST handle both formats gracefully. When reading facts/constraints, check `isinstance(item, dict)` before calling `.get()`.
-
 ### §6G status.yaml Schema
 
-This schema reflects what PST tools actually read and write. When tools and this schema disagree, **tools are the truth** — update this section. (Authoritative consumers noted per block.)
+This schema reflects what PST tools actually read and write. When tools and this schema disagree, **tools are the truth**. Block authority lives at the end of this section.
 
 ```yaml
 meta:
   project_name: string
-  schema_version: int                    # ELP/PST both write
+  schema_version: int
   created: ISO
   last_updated: ISO
-  last_run: ISO                          # ELP/PST both write
+  last_run: ISO
   total_artifacts: int
   total_research: int
   total_blockers: int
   hotspots: []
-  source_root: string (optional)         # ELP writes; render_status reads → landing README front-matter
-  scope: string[] (optional)             # ELP writes; render_status reads
-  pst_root: string (optional)            # ELP writes; render_status reads
-  coding_standards: string (optional)    # ELP writes; render_status reads → ## Coding Standards body
-  summary:                               # consumed by render_status.py
+  source_root: string                    # optional
+  scope: string[]                        # optional
+  pst_root: string                       # optional
+  coding_standards: string               # optional → ## Coding Standards body
+  summary:
     artifacts_total: int
     artifacts_ready: int
     artifacts_blocked: int
@@ -430,14 +346,14 @@ meta:
     handoffs_stale: int
     handoffs_invalidated: int
     handoffs_pending_consumers: int
-  pointers:                              # consumed by render_status.py
+  pointers:
     entry_point: string                  # typically "AGENTS.md"
     views_dir: string                    # typically "views/"
     status_report: string
     handoff_view: string
     prompt_chain: string
 
-project:                                 # consumed by validate_status.py + render_status.py
+project:
   name: string
   phase: string                          # e.g. "execution"
   version: string
@@ -450,14 +366,14 @@ gates: [{id, name, status, checks[{id, description, status}]}]
 preconditions: [{id, target, requires[{artifact|handoff, field, condition}], status}]
 handoff_contexts:
   - id: string                           # e.g. "HC-001"
-    title: string (optional)
+    title: string                        # optional
     producer: string                     # artifact id
-    producer_type: string (optional)     # e.g. "landing_prompt"
-    produced_from: string[] (optional)
+    producer_type: string                # optional, e.g. "landing_prompt"
+    produced_from: string[]              # optional
     version: int
     status: string                       # available | stale | invalidated | consumed
-    results: [] (optional)
-    invalidated_by: [] (optional)
+    results: []                          # optional
+    invalidated_by: []                   # optional
     facts: []                            # structured {id, statement, source, confidence} OR legacy string
     constraints: []                      # structured {id, statement, source} OR legacy string
     consumed_by: string[]
@@ -466,13 +382,13 @@ handoff_contexts:
         status: string                   # pending | consumed | stale
         consumed_version: int | null
         consumed_at: ISO | null
-    last_verified: ISO (optional)
+    last_verified: ISO                   # optional
 change_events:
   - id: string                           # e.g. "CE-001"
     time: ISO
     source: string                       # e.g. "Execute-LandingPrompt", "project-state-tracker"
     event_type: string                   # e.g. "lp_execution", "scaffold_and_execute"
-    summary: string (optional)
+    summary: string                      # optional
     affected: string[]                   # artifact ids
     transitions:
       - artifact: string
@@ -480,11 +396,11 @@ change_events:
         to: string
         reason: string
 
-evidence: []                             # consumed by validate_status.py (placeholder list)
+evidence: []                             # placeholder list
 assumptions: []                          # placeholder list
 dependencies: []                         # placeholder list (NOT artifacts[].depends_on)
 
-rules:                                   # consumed by validate_status.py
+rules:
   research_is_fact_only: bool
   status_is_single_source_of_truth: bool
   landing_requires_test_ready: bool
@@ -492,16 +408,17 @@ rules:                                   # consumed by validate_status.py
   landing_invalidates_test: bool
 
 snapshots:
+  enabled: bool                          # REQUIRED by validate_status.py
   git_baseline: string | null
   file_hashes: {path: sha256}
 ```
 
 **Block authority:**
-- `validate_status.py` is the authoritative consumer for `project`, `rules`, `evidence`, `assumptions`, `dependencies`.
-- `render_status.py` is the authoritative consumer for `meta.summary` and `meta.pointers`.
-- `apply_changes.py` is the authoritative writer for `artifacts`, `handoff_contexts`, `change_events`.
-- ELP is the authoritative writer for `meta.source_root`, `meta.scope`, `meta.pst_root`, `meta.coding_standards` (mirrors README front-matter / body).
+- `validate_status.py` — authoritative consumer for `project`, `rules`, `evidence`, `assumptions`, `dependencies`, `snapshots`.
+- `render_status.py` — authoritative consumer for `meta.summary` and `meta.pointers`.
+- `apply_changes.py` — authoritative writer for `artifacts`, `handoff_contexts`, `change_events`.
+- ELP — authoritative writer for `meta.source_root`, `meta.scope`, `meta.pst_root`, `meta.coding_standards`.
 
 If you add a new block, update both this schema section and the consuming tool — they must move together.
 
-**Legacy compatibility (facts/constraints):** `handoff_contexts[].facts` and `.constraints` accept BOTH structured dict format `{id, statement, source, confidence?}` AND legacy bare-string format. PST tools (`render_status.py`, `propagate.py`) MUST guard with `isinstance(x, dict)` before `.get()`. ELP v3+ always writes structured.
+**Legacy compatibility (facts/constraints):** `handoff_contexts[].facts` / `.constraints` accept BOTH structured dict `{id, statement, source, confidence?}` AND legacy bare-string format. PST tools MUST guard with `isinstance(x, dict)` before `.get()`. ELP v3+ always writes structured.

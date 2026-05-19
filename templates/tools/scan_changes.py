@@ -40,6 +40,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _yaml_compat as yaml
 
 
+# NOTE: Only these directories are scanned. Artifacts with path "external:*"
+# (managed by Execute-LandingPrompt) are implicitly skipped because they don't
+# reside in any of these directories. If external artifact paths are ever changed
+# to relative paths within these dirs, explicit skip logic must be added here.
 SCANNED_DIRS = [
     ("research", "research"),
     ("decisions", "decision"),
@@ -50,6 +54,11 @@ SCANNED_DIRS = [
 
 # Filenames that live inside scanned dirs but are NOT artifacts.
 META_FILES = {"README.md", "readme.md", ".gitkeep", ".gitignore"}
+
+# Paths starting with "external:" in status.yaml are agent-managed (by ELP).
+# They are never on disk under scanned dirs, so scan_changes naturally skips them.
+# This constant documents the convention for future maintainers.
+EXTERNAL_PATH_PREFIX = "external:"
 
 
 def is_meta(rel_path: str) -> bool:
