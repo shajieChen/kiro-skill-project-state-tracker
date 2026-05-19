@@ -59,6 +59,7 @@ ELP is a trusted external executor that writes status.yaml directly (or via appl
 - ELP may transition LP artifacts: `ready → ready`, `ready → needs_update`, `ready → blocked`, `needs_update → ready`, `blocked → ready`. These collapse the `needs_update → draft → reviewed → approved → ready` chain because ELP performs all intermediate steps atomically.
 - Artifacts with `path: "external:*"` are "agent-managed" — scan_changes (which subsumes the legacy dirty_check role) skips them. Only ELP (or manual user action) can transition their state.
 - When AUDIT Step 4 encounters a transition authored by `source: Execute-LandingPrompt`, auto-approve at high confidence (ELP is a trusted source).
+- ELP-authored transitions are NOT state-machine-validated by `apply_changes.py`. ELP is contractually responsible for emitting only transitions in the whitelist above. PST AUDIT Step 4 acts as a second-line reviewer that may flag (but typically auto-approves) ELP writes.
 
 ---
 
@@ -69,8 +70,12 @@ Execute FIRST. Stop at first match.
 ```
 exists(status/status.yaml)?
   NO  → has tracked files? → YES: INIT_FROM_DOCS (§3A) / NO: INIT_EMPTY (§3B)
-  YES → AUDIT (§4)
+  YES → exists(tools/render_status.py) AND exists(views/)?
+          NO  → INIT_COMPLETE_SCAFFOLD (§3C)
+          YES → AUDIT (§4)
 ```
+
+The §3C branch handles the common case where Execute-LandingPrompt has scaffolded a minimal `status.yaml` but cannot create `tools/` or `views/`. Without this branch, a subsequent `Skill project-state-tracker + init` would incorrectly route to AUDIT and never produce the missing infrastructure.
 
 **User-intent routing (override detection):**
 
@@ -105,6 +110,21 @@ exists(status/status.yaml)?
 1. Create all directories
 2. Create empty status.yaml (meta only)
 3. Render views + READMEs → emit report (§5)
+
+### §3C INIT_COMPLETE_SCAFFOLD
+
+Triggered when `status.yaml` exists but `tools/` and/or `views/` are missing — typically because Execute-LandingPrompt bootstrapped a minimal workspace and now needs PST to complete the infrastructure. This mode is **directory/tool catch-up only** — it never re-infers dependencies and never mutates existing artifact records.
+
+1. Create missing directories: `tools/`, `views/`, `status/.cache/`, `prompts/landing/`, `prompts/test/` (idempotent — skip any that already exist)
+2. Write the Python tool set into `tools/` from the PST skill's `templates/tools/` source (same set as §3A scaffold step 1)
+3. Read-only shape validation: `python tools/validate_status.py --project <p>` — report any failures but do NOT auto-fix; report-only
+4. Render views + READMEs: `python tools/render_status.py --project <p>`
+5. Emit report (§5) — in `## Processing Summary` explicitly note: "Completed scaffold from partial workspace (likely Execute-LandingPrompt bootstrap)" so the user knows the prior state
+
+**Constraints:**
+- Do NOT re-infer dependencies. Do NOT run `propagate.py`. Do NOT modify any artifact record in `status.yaml`.
+- Do NOT delete or overwrite any existing tool file (idempotent reinstall is acceptable only if hashes match the template; otherwise leave user-modified files alone and warn in the report).
+- The next user-invoked `Skill project-state-tracker + audit` will route normally to §4.
 
 ---
 
@@ -202,7 +222,9 @@ Discard from working memory after step completes.
 
 **DO:** Preserve user fields; record all changes in change_events; `requires_agent_review: true` for <80% confidence; PCs for every LP; tools for mechanical work; sequential IDs; trust ELP-authored transitions (source: Execute-LandingPrompt) as high-confidence.
 
-**DON'T:** Copy body text into status.yaml; set "ready" without PCs passing (except ELP which validates PCs during execution); edit user files; propagate beyond graph; treat views/ as truth; auto-bump HC versions (ELP may bump only when content changes); edit status.yaml directly (except ELP in scaffold-only workspaces).
+**DON'T:** Copy body text into status.yaml; set "ready" without preconditions passing; edit user files; propagate beyond graph; treat views/ as truth; auto-bump HC versions (ELP may bump only when content changes); edit status.yaml directly (except ELP in scaffold-only workspaces).
+
+**ELP "ready" exception (explicit invariant):** ELP MAY set status to `ready` ONLY when its Dependency Gate result is `passed` (preconditions verified before execution). On `forced override` or `verify-only override`, ELP MUST map the artifact to `needs_update`, even if Phase A succeeded — the "ready requires PCs passed" invariant must hold. This invariant is enforced by ELP itself; `apply_changes.py` does not validate it.
 
 **meta schema extensions (for README generation):**
 - `source_root`: string, optional — source code root directory for ELP
@@ -378,29 +400,108 @@ Never auto-bump HC versions — EXCEPT when Execute-LandingPrompt writes a HC up
 
 ELP v3+ always writes structured format. PST tools (render_status.py, propagate.py) MUST handle both formats gracefully. When reading facts/constraints, check `isinstance(item, dict)` before calling `.get()`.
 
-### §6G status.yaml Schema (Compact)
+### §6G status.yaml Schema
+
+This schema reflects what PST tools actually read and write. When tools and this schema disagree, **tools are the truth** — update this section. (Authoritative consumers noted per block.)
 
 ```yaml
 meta:
   project_name: string
+  schema_version: int                    # ELP/PST both write
   created: ISO
   last_updated: ISO
+  last_run: ISO                          # ELP/PST both write
   total_artifacts: int
   total_research: int
   total_blockers: int
   hotspots: []
-  source_root: string (optional)      # for README generation + ELP
-  scope: string[] (optional)           # for README generation + ELP
-  pst_root: string (optional)          # for README generation + ELP
-  coding_standards: string (optional)  # for README generation + ELP
+  source_root: string (optional)         # ELP writes; render_status reads → landing README front-matter
+  scope: string[] (optional)             # ELP writes; render_status reads
+  pst_root: string (optional)            # ELP writes; render_status reads
+  coding_standards: string (optional)    # ELP writes; render_status reads → ## Coding Standards body
+  summary:                               # consumed by render_status.py
+    artifacts_total: int
+    artifacts_ready: int
+    artifacts_blocked: int
+    artifacts_needs_update: int
+    blockers_open: int
+    gates_failed: int
+    handoffs_total: int
+    handoffs_stale: int
+    handoffs_invalidated: int
+    handoffs_pending_consumers: int
+  pointers:                              # consumed by render_status.py
+    entry_point: string                  # typically "AGENTS.md"
+    views_dir: string                    # typically "views/"
+    status_report: string
+    handoff_view: string
+    prompt_chain: string
 
-artifacts: [{id, type, path, status, depends_on[], produces_handoffs?[], consumes_handoffs?[]}]
+project:                                 # consumed by validate_status.py + render_status.py
+  name: string
+  phase: string                          # e.g. "execution"
+  version: string
+
+artifacts: [{id, type, path, status, depends_on[], produces_handoffs?[], consumes_handoffs?[], last_checked?}]
 research_findings: [{id, title, path, status, evidence?[], affects?[]}]
 decisions: [{id, title, path, status, based_on[], rejects?[], affects?[]}]
 blockers: [{id, title, severity, status, blocks[]}]
 gates: [{id, name, status, checks[{id, description, status}]}]
 preconditions: [{id, target, requires[{artifact|handoff, field, condition}], status}]
-handoff_contexts: [{id, producer, version, status, facts[], constraints[], consumed_by[], consumed_status[]}]
-change_events: [{id, time, source, event_type, affected[], transitions[{artifact, from, to, reason}]}]
-snapshots: {git_baseline, file_hashes: {path: sha256}}
+handoff_contexts:
+  - id: string                           # e.g. "HC-001"
+    title: string (optional)
+    producer: string                     # artifact id
+    producer_type: string (optional)     # e.g. "landing_prompt"
+    produced_from: string[] (optional)
+    version: int
+    status: string                       # available | stale | invalidated | consumed
+    results: [] (optional)
+    invalidated_by: [] (optional)
+    facts: []                            # structured {id, statement, source, confidence} OR legacy string
+    constraints: []                      # structured {id, statement, source} OR legacy string
+    consumed_by: string[]
+    consumed_status:
+      - consumer: string                 # artifact id
+        status: string                   # pending | consumed | stale
+        consumed_version: int | null
+        consumed_at: ISO | null
+    last_verified: ISO (optional)
+change_events:
+  - id: string                           # e.g. "CE-001"
+    time: ISO
+    source: string                       # e.g. "Execute-LandingPrompt", "project-state-tracker"
+    event_type: string                   # e.g. "lp_execution", "scaffold_and_execute"
+    summary: string (optional)
+    affected: string[]                   # artifact ids
+    transitions:
+      - artifact: string
+        from: string | null
+        to: string
+        reason: string
+
+evidence: []                             # consumed by validate_status.py (placeholder list)
+assumptions: []                          # placeholder list
+dependencies: []                         # placeholder list (NOT artifacts[].depends_on)
+
+rules:                                   # consumed by validate_status.py
+  research_is_fact_only: bool
+  status_is_single_source_of_truth: bool
+  landing_requires_test_ready: bool
+  plan_invalidates_landing: bool
+  landing_invalidates_test: bool
+
+snapshots:
+  git_baseline: string | null
+  file_hashes: {path: sha256}
 ```
+
+**Block authority:**
+- `validate_status.py` is the authoritative consumer for `project`, `rules`, `evidence`, `assumptions`, `dependencies`.
+- `render_status.py` is the authoritative consumer for `meta.summary` and `meta.pointers`.
+- `apply_changes.py` is the authoritative writer for `artifacts`, `handoff_contexts`, `change_events`.
+- ELP is the authoritative writer for `meta.source_root`, `meta.scope`, `meta.pst_root`, `meta.coding_standards` (mirrors README front-matter / body).
+
+If you add a new block, update both this schema section and the consuming tool — they must move together.
+
+**Legacy compatibility (facts/constraints):** `handoff_contexts[].facts` and `.constraints` accept BOTH structured dict format `{id, statement, source, confidence?}` AND legacy bare-string format. PST tools (`render_status.py`, `propagate.py`) MUST guard with `isinstance(x, dict)` before `.get()`. ELP v3+ always writes structured.
