@@ -127,7 +127,7 @@ project:
   phase: string                          # e.g. "execution"
   version: string
 
-artifacts: [{id, type, path, status, depends_on[], produces_handoffs?[], consumes_handoffs?[], last_checked?}]
+artifacts: [{id, type, path, status, depends_on[], group?, produces_handoffs?[], consumes_handoffs?[], last_checked?}]
 research_findings: [{id, title, path, status, evidence?[], affects?[]}]
 decisions: [{id, title, path, status, based_on[], rejects?[], affects?[]}]
 blockers: [{id, title, severity, status, blocks[]}]
@@ -191,3 +191,41 @@ snapshots:
 If you add a new block, update both this schema section and the consuming tool — they must move together.
 
 **Legacy compatibility (facts/constraints):** `handoff_contexts[].facts` / `.constraints` accept BOTH structured dict `{id, statement, source, confidence?}` AND legacy bare-string format. PST tools MUST guard with `isinstance(x, dict)` before `.get()`. ELP v3+ always writes structured.
+
+### §6H Group Derivation Rules
+
+**Purpose:** Assign a `group` field to each artifact for dashboard column grouping. Runs during INIT §3A (Step 2.5) and AUDIT §4 (Step 2, for artifacts missing `group`).
+
+**Priority (per artifact):**
+1. If `group` is already non-empty → skip (user-declared, never overwrite)
+2. If `type == "plan"` → `group = extract_topic(id)`
+3. If `type in ("landing_prompt", "test_prompt")` → walk `depends_on` to find root Plan → use that Plan's group
+4. Otherwise → `group = "Other"`
+
+**`extract_topic(plan_id)`:**
+1. Strip `Plan.` prefix (case-sensitive)
+2. If remainder matches `Phase\d+.*` → return `Phase{N}` (e.g., `Plan.Phase1-BitStream` → `Phase1`)
+3. If remainder contains `codegen` (case-insensitive) → return `CodeGen`
+4. Otherwise return remainder as-is (e.g., `Plan.PR3_Runtime` → `PR3_Runtime`)
+
+**`find_root_plan(artifact)` — Dependency Chain Walk:**
+1. BFS through `depends_on[]` (resolve IDs against `artifacts[]`)
+2. Max depth: 5 (prevents infinite loops)
+3. Return the first artifact with `type: plan` encountered
+4. If multiple Plans at same depth, use the first in `depends_on` order
+5. If no Plan found → return None
+
+**`extract_topic_from_id(artifact_id)` — Orphan LP/TP Fallback:**
+Used only when `find_root_plan` returns None.
+1. Strip known type prefixes: `LP.`, `TP.`, `LandingPrompt.`, `TestPrompt.`, `Plan.`
+2. Strip leading numeric prefix + separator (regex: `^\d+[_-]`)
+3. Extract first underscore-or-hyphen-delimited segment as candidate
+4. Search all Plan artifacts for one whose `extract_topic(plan.id)` starts with or equals candidate
+5. If found → return that Plan's group
+6. If not found → return None (artifact gets `group: "Other"`)
+
+**Constraints:**
+- MUST NOT modify any artifact field other than `group`
+- MUST NOT overwrite existing non-empty `group` values
+- MUST run AFTER dependency inference (§6B) so `depends_on` is available
+- Max BFS depth: 5
