@@ -119,6 +119,7 @@ The §3C branch handles the common case where Execute-LandingPrompt has scaffold
 
 1. Scaffold: `status/`, `status/.cache/`, `views/`, `tools/`, `prompts/landing/`, `prompts/test/`, `research/`, `decisions/`, `plan/`, `outputs/`
 2. Scan ALL tracked files → extract ID + title + type (load companion §6A)
+2.5. Derive groups for all artifacts (load companion §6H)
 3. Infer dependencies from content (load companion §6B) — full content read, all phases
 4. Generate preconditions for LPs (load companion §6C) — skip if no LPs
 5. Suggest handoff contexts (load companion §6F) — skip if no downstream refs
@@ -154,7 +155,7 @@ Each step declares Input/Output/Fail contracts. Step 4 is the ONLY step requirin
 |------|--------|-------|--------|------|
 | 0 | **Drain `pending_writebacks.json`** (see §9) → `scan_changes.py` (dirty probe; inspect `changes[]` count) | project path | `{status, dirty_files[]}` | scan `"error"` → `status.yaml` likely missing/corrupt; abort AUDIT, route to §3 INIT family |
 | 1 | `scan_changes.py` | project path | `changed_files.json` | empty AND no drained writebacks AND `status.yaml` mtime unchanged since last AUDIT → fast-exit (skip to Step 7 render-skip check) |
-| 2 | Re-extract metadata | changed_files + sources | updated artifact records | parse error → `requires_agent_review: true` |
+| 2 | Re-extract metadata + derive groups | changed_files + sources | updated artifact records (incl. `group` field) | parse error → `requires_agent_review: true` |
 | 2.5 | **Incremental PC generation** (§6C) — scan artifacts for LPs missing PCs and append; covers PSS-added LPs | status.yaml | updated `preconditions[]` + Gate G-001 if needed | — |
 | 2.6 | **Pending-consumers backfill** (§6F) — scan every HC's `pending_consumers[]`; for each token resolvable against current `artifacts[].id`, move it to `consumed_by[]` and add a `consumed_status` `{consumer, status: pending, consumed_version: null, consumed_at: null}` row. Tokens that still do not resolve stay in `pending_consumers[]` for a future cycle. Never delete an entry that did not resolve. | status.yaml | updated `handoff_contexts[*].consumed_by` and `consumed_status` | — |
 | 3 | `propagate.py` | changed_files + status.yaml | `candidate_transitions.json` | no candidates → skip to Step 6 |
@@ -221,6 +222,7 @@ Load matching Part C subsection ONLY when executing its step; discard after. §6
 | §6C Precondition Gen | Step 4 (LP candidates present) | medium |
 | §6F Handoff Management | Step 4 (HC candidates present) | low |
 | §6G Schema Reference | On validation error only | low |
+| §6H Group Derivation | Step 2 (derive groups) | medium |
 
 ---
 
