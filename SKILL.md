@@ -321,6 +321,7 @@ ELP appends to `queue[]` on Phase B failure (see ELP `§ Error Handling`). Write
 - `AGENTS.md`, `README.md`, `prompts/landing/README.md`, `prompts/test/README.md` (regenerated)
 - `tools/**` (skill-managed)
 - `outputs/**` (LP execution artifacts — never source)
+- `Result/**` (ELP execution result archive — never source)
 - Any file whose `path` in `artifacts[]` starts with `external:` (agent-managed, not on disk)
 
 This is already enforced by the SCANNED_DIRS allow-list inside `scan_changes.py`; this section is the contract for agents and future maintainers.
