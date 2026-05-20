@@ -6,9 +6,11 @@ Kiro Agent Skill — 管理 Research / Decision / Plan / LandingPrompt / TestPro
 
 - 9-state 状态机流转（draft → reviewed → approved → ready → …）
 - **INFERENCE** 核心能力：读取文档自动提取 artifact ID、依赖关系、handoff context
+- **Group Derivation** — 依赖链聚类自动推导泳道分组，无需硬编码命名规则
 - SCL Pipeline: dirty_check → scan → propagate → review → apply → render
 - 确定性质量验证（quality_check.py, 10 条规则）
 - 自动生成 views（DAG、泳道图、状态统计）和 AGENTS.md
+- `Result/**` 路径自动排除扫描（配合 ELP Result 持久化）
 
 ## 运行模式
 
