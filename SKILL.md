@@ -346,22 +346,19 @@ Read-only quality audit of ready LandingPrompts. Traces each ready LP back to it
 
 ### Tool Location
 
-`review_quality.py` lives in the PST skill's own `tools/` directory (canonical source). Unlike other PST tools that are copied into each project's `tools/`, this tool is run **directly from the skill source directory** because:
-- It is read-only (never modifies status.yaml)
-- It does not need to be invoked by other actors (ELP, PSS)
-- Avoids requiring re-init for existing projects
+`review_quality.py` is located at:
 
-**Resolution order:**
-1. `<project>/tools/review_quality.py` (if previously deployed via §3C)
-2. `<PST skill dir>/tools/review_quality.py` (canonical fallback — always available)
+```
+C:\Users\chenshajie\.kiro\skills\project-state-tracker\tools\review_quality.py
+```
 
-The PST skill directory is the directory containing this SKILL.md file.
+Run it directly from this absolute path. Do NOT search the workspace or project `tools/` directory — this tool lives only in the PST skill source and is never copied to projects.
 
 ### Pipeline
 
 | Step | Action | Input | Output | Fail |
 |------|--------|-------|--------|------|
-| 1 | `python <resolved_review_quality_path> --project <p>` | project path | `status/.cache/review_context.json` | No ready LP → report "无可审计对象" and exit |
+| 1 | `python C:\Users\chenshajie\.kiro\skills\project-state-tracker\tools\review_quality.py --project <p>` | project path | `status/.cache/review_context.json` | No ready LP → report "无可审计对象" and exit |
 | 2 | Agent reads review_context.json | JSON | Audit plan | — |
 | 3 | **Phase 1: AC satisfaction** — for each ready LP, for each AC: read Result file + code snapshot → judge pass/partial/fail with one-line reason | Result + code | AC verdicts | Single AC unjudgeable → mark `inconclusive` |
 | 4 | **Phase 2: Architecture conformance** — read Plan architecture section + Decision constraints + actual code structure → judge each dimension | Plan + Decision + code | Architecture verdicts | Decision missing → skip constraint check |
