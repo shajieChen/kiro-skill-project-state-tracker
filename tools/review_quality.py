@@ -53,8 +53,71 @@ def main():
         print("[review_quality] No ready LPs found. Nothing to review.")
         sys.exit(0)
 
-    # TODO: will be filled in Task 2 and Task 3
-    print(f"[review_quality] Found {len(ready_lps)} ready LP(s)")
+    lp_contexts = []
+    plan_art = None  # Will hold the last found plan for architecture extraction
+
+    for lp in ready_lps:
+        lp_ctx = {
+            "id": lp["id"],
+            "title": lp.get("title", lp["id"]),
+            "path": lp.get("path", ""),
+            "plan_id": None,
+            "plan_path": None,
+            "decision_id": None,
+            "decision_path": None,
+            "acceptance_criteria": [],
+            "result_files": [],
+            "modified_files": [],
+        }
+
+        # Trace to Plan
+        found_plan = _trace_plan(lp, arts_by_id)
+        if found_plan:
+            plan_art = found_plan
+            lp_ctx["plan_id"] = found_plan["id"]
+            lp_ctx["plan_path"] = found_plan.get("path")
+
+            # Trace to Decision
+            found_decision = _trace_decision(found_plan, arts_by_id)
+            if found_decision:
+                lp_ctx["decision_id"] = found_decision["id"]
+                lp_ctx["decision_path"] = found_decision.get("path")
+
+        lp_contexts.append(lp_ctx)
+
+    # Architecture extraction and AC parsing will be added in Task 3
+    _write_context(project, meta, lp_contexts, None)
+    print(f"[review_quality] Processed {len(lp_contexts)} LP(s)")
+
+
+def _trace_plan(art: dict, arts_by_id: dict) -> dict | None:
+    """Walk depends_on to find the first Plan artifact. BFS, max depth 3."""
+    queue = list(art.get("depends_on") or [])
+    visited = set()
+    depth = 0
+    while queue and depth < 3:
+        next_queue = []
+        for dep_id in queue:
+            if dep_id in visited:
+                continue
+            visited.add(dep_id)
+            dep = arts_by_id.get(dep_id)
+            if dep and dep.get("type") == "plan":
+                return dep
+            if dep:
+                next_queue.extend(dep.get("depends_on") or [])
+        queue = next_queue
+        depth += 1
+    return None
+
+
+def _trace_decision(plan_art: dict, arts_by_id: dict) -> dict | None:
+    """From a Plan artifact, find the first Decision in depends_on."""
+    for dep_id in plan_art.get("depends_on") or []:
+        dep = arts_by_id.get(dep_id)
+        if dep and dep.get("type") == "decision":
+            return dep
+    return None
 
 
 def _write_context(project: str, meta: dict, ready_lps: list, architecture: dict | None):
