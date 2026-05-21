@@ -125,7 +125,9 @@ def main():
 
 
 def _trace_plan(art: dict, arts_by_id: dict) -> dict | None:
-    """Walk depends_on to find the first Plan artifact. BFS, max depth 3."""
+    """Walk depends_on to find the first Plan artifact. BFS, max depth 3.
+    Fallback: if no depends_on link, try group matching, then return any Plan."""
+    # Primary: BFS through depends_on
     queue = list(art.get("depends_on") or [])
     visited = set()
     depth = 0
@@ -142,6 +144,19 @@ def _trace_plan(art: dict, arts_by_id: dict) -> dict | None:
                 next_queue.extend(dep.get("depends_on") or [])
         queue = next_queue
         depth += 1
+
+    # Fallback 1: match by group field
+    lp_group = art.get("group")
+    if lp_group:
+        for a in arts_by_id.values():
+            if a.get("type") == "plan" and a.get("group") == lp_group:
+                return a
+
+    # Fallback 2: if only one Plan exists in the project, use it
+    all_plans = [a for a in arts_by_id.values() if a.get("type") == "plan"]
+    if len(all_plans) == 1:
+        return all_plans[0]
+
     return None
 
 

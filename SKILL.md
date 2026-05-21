@@ -344,21 +344,23 @@ Read-only quality audit of ready LandingPrompts. Traces each ready LP back to it
 - `status/status.yaml` exists
 - At least one LP artifact with `status == "ready"`
 
-### Tool Location
+### Tool Location (review_quality.py)
 
-`review_quality.py` is located at:
+**Resolution order (stop at first hit):**
 
-```
-C:\Users\chenshajie\.kiro\skills\project-state-tracker\tools\review_quality.py
-```
+1. Check `<pst_root>/tools/review_quality.py` — the project's own tools directory (deployed via §3C INIT)
+2. If not found → use `C:\Users\chenshajie\.kiro\skills\project-state-tracker\tools\review_quality.py`
 
-Run it directly from this absolute path. Do NOT search the workspace or project `tools/` directory — this tool lives only in the PST skill source and is never copied to projects.
+Step 1 uses the same `<pst_root>` resolved from `meta.pst_root` in status.yaml (or the project path passed to the skill).
+Step 2 is the hardcoded canonical fallback — always exists on this machine.
+
+**Do NOT search the workspace.** Only check these two paths in order.
 
 ### Pipeline
 
 | Step | Action | Input | Output | Fail |
 |------|--------|-------|--------|------|
-| 1 | `python C:\Users\chenshajie\.kiro\skills\project-state-tracker\tools\review_quality.py --project <p>` | project path | `status/.cache/review_context.json` | No ready LP → report "无可审计对象" and exit |
+| 1 | Run `python <resolved_path> --project <p>` where `<resolved_path>` follows Tool Location resolution above | project path | `status/.cache/review_context.json` | No ready LP → report "无可审计对象" and exit |
 | 2 | Agent reads review_context.json | JSON | Audit plan | — |
 | 3 | **Phase 1: AC satisfaction** — for each ready LP, for each AC: read Result file + code snapshot → judge pass/partial/fail with one-line reason | Result + code | AC verdicts | Single AC unjudgeable → mark `inconclusive` |
 | 4 | **Phase 2: Architecture conformance** — read Plan architecture section + Decision constraints + actual code structure → judge each dimension | Plan + Decision + code | Architecture verdicts | Decision missing → skip constraint check |
