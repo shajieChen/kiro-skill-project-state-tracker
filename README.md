@@ -1,3 +1,7 @@
+---
+agent_load: false
+---
+
 # project-state-tracker
 
 Kiro Agent Skill — 管理 Research / Decision / Plan / LandingPrompt / TestPrompt 工件的完整生命周期，通过中心化 `status.yaml` 追踪状态与依赖。

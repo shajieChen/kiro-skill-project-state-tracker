@@ -87,99 +87,32 @@ Existing `consumed_by[]` and `consumed_status[]` entries are never mutated by ba
 
 ### §6G status.yaml Schema
 
-This schema reflects what PST tools actually read and write. When tools and this schema disagree, **tools are the truth**. Block authority lives at the end of this section.
+Full structural constraints (required fields, valid statuses, ID prefixes) live in the machine-readable schema file:
+
+```
+tools/_schema_default.yaml
+```
+
+When tools and this schema disagree, **tools are the truth**.
+
+**Top-level structure (quick reference):**
 
 ```yaml
-meta:
-  project_name: string
-  schema_version: int
-  created: ISO
-  last_updated: ISO
-  last_run: ISO
-  total_artifacts: int
-  total_research: int
-  total_blockers: int
-  hotspots: []
-  source_root: string                    # optional
-  scope: string[]                        # optional
-  pst_root: string                       # optional
-  coding_standards: string               # optional → ## Coding Standards body
-  summary:
-    artifacts_total: int
-    artifacts_ready: int
-    artifacts_blocked: int
-    artifacts_needs_update: int
-    blockers_open: int
-    gates_failed: int
-    handoffs_total: int
-    handoffs_stale: int
-    handoffs_invalidated: int
-    handoffs_pending_consumers: int
-  pointers:
-    entry_point: string                  # typically "AGENTS.md"
-    views_dir: string                    # typically "views/"
-    status_report: string
-    handoff_view: string
-    prompt_chain: string
-
-project:
-  name: string
-  phase: string                          # e.g. "execution"
-  version: string
-
+meta: {project_name, schema_version, created, last_updated, last_run, source_root?, scope?[], pst_root?, coding_standards?, summary:{...}, pointers:{...}}
+project: {name, phase, version}
 artifacts: [{id, type, path, status, depends_on[], group?, produces_handoffs?[], consumes_handoffs?[], last_checked?}]
 research_findings: [{id, title, path, status, evidence?[], affects?[]}]
 decisions: [{id, title, path, status, based_on[], rejects?[], affects?[]}]
 blockers: [{id, title, severity, status, blocks[]}]
 gates: [{id, name, status, checks[{id, description, status}]}]
 preconditions: [{id, target, requires[{artifact|handoff, field, condition}], status}]
-handoff_contexts:
-  - id: string                           # e.g. "HC-001"
-    title: string                        # optional
-    producer: string                     # artifact id
-    producer_type: string                # optional, e.g. "landing_prompt"
-    produced_from: string[]              # optional
-    version: int
-    status: string                       # available | stale | invalidated | consumed
-    results: []                          # optional
-    invalidated_by: []                   # optional
-    facts: []                            # structured {id, statement, source, confidence} OR legacy string
-    constraints: []                      # structured {id, statement, source} OR legacy string
-    consumed_by: string[]
-    consumed_status:
-      - consumer: string                 # artifact id
-        status: string                   # pending | consumed | stale
-        consumed_version: int | null
-        consumed_at: ISO | null
-    last_verified: ISO                   # optional
-change_events:
-  - id: string                           # e.g. "CE-001"
-    time: ISO
-    source: string                       # e.g. "Execute-LandingPrompt", "project-state-tracker"
-    event_type: string                   # e.g. "lp_execution", "scaffold_and_execute"
-    summary: string                      # optional
-    affected: string[]                   # artifact ids
-    transitions:
-      - artifact: string
-        from: string | null
-        to: string
-        reason: string
-
-evidence: []                             # placeholder list
-assumptions: []                          # placeholder list
-dependencies: []                         # placeholder list (NOT artifacts[].depends_on)
-
-rules:
-  research_is_fact_only: bool
-  status_is_single_source_of_truth: bool
-  landing_requires_test_ready: bool
-  plan_invalidates_landing: bool
-  landing_invalidates_test: bool
-
-snapshots:
-  enabled: bool                          # REQUIRED by validate_status.py
-  git_baseline: string | null
-  file_hashes: {path: sha256}
+handoff_contexts: [{id, title?, producer, producer_type?, version, status, facts[], constraints[], consumed_by[], consumed_status[{consumer, status, consumed_version, consumed_at}], pending_consumers?[]}]
+change_events: [{id, time, source, event_type, summary?, affected[], transitions[{artifact, from, to, reason}]}]
+evidence: []
+assumptions: []
+dependencies: []
+rules: {research_is_fact_only, status_is_single_source_of_truth, landing_requires_test_ready, plan_invalidates_landing, landing_invalidates_test}
+snapshots: {enabled, git_baseline, file_hashes}
 ```
 
 **Block authority:**
@@ -188,7 +121,7 @@ snapshots:
 - `apply_changes.py` — authoritative writer for `artifacts`, `handoff_contexts`, `change_events`.
 - ELP — authoritative writer for `meta.source_root`, `meta.scope`, `meta.pst_root`, `meta.coding_standards`.
 
-If you add a new block, update both this schema section and the consuming tool — they must move together.
+If you add a new block, update both `_schema_default.yaml` and the consuming tool — they must move together.
 
 **Legacy compatibility (facts/constraints):** `handoff_contexts[].facts` / `.constraints` accept BOTH structured dict `{id, statement, source, confidence?}` AND legacy bare-string format. PST tools MUST guard with `isinstance(x, dict)` before `.get()`. ELP v3+ always writes structured.
 
