@@ -50,7 +50,18 @@ def _topological_sort_lps(artifacts: list) -> list:
     if len(result) < len(lps):
         remaining = sorted(ids - set(result))
         result.extend(remaining)
-    return result
+
+    # B5 fix: map IDs to filename stems for more precise sequence tokens.
+    # ELP's LP 序列解析 uses substring matching against these tokens.
+    id_to_stem = {}
+    for a in lps:
+        path = a.get("path", "")
+        if path:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            id_to_stem[a["id"]] = stem
+        else:
+            id_to_stem[a["id"]] = a["id"]
+    return [id_to_stem.get(aid, aid) for aid in result]
 
 
 def render_project_readme(status: dict, project: str) -> str:

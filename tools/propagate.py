@@ -331,9 +331,28 @@ def evaluate_preconditions(status: dict) -> list[dict]:
                 passing = False
                 break
             field = req.get("field", "status")
-            expected = req.get("equals")
             actual = tgt.get(field)
-            if actual != expected:
+            # B3 fix: support multiple comparison operators in requires-clauses.
+            # PSS generates "condition": "in [approved, ready]" format.
+            if "equals" in req:
+                if actual != req["equals"]:
+                    passing = False
+                    break
+            elif "condition" in req:
+                cond = req["condition"]
+                if cond.startswith("in [") and cond.endswith("]"):
+                    allowed = [v.strip() for v in cond[4:-1].split(",")]
+                    if actual not in allowed:
+                        passing = False
+                        break
+                else:
+                    passing = False
+                    break
+            elif "in" in req:
+                if actual not in (req["in"] or []):
+                    passing = False
+                    break
+            else:
                 passing = False
                 break
         new = "passing" if passing else "failed"

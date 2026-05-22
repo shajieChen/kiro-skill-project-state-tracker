@@ -336,6 +336,13 @@ def _apply_handoff_version(status: dict, t: dict) -> list:
         return []
     prev_v = hc.get("version")
     hc["version"] = new_v
+    # B1 fix: replace facts/constraints if supplied (replacement semantics
+    # per ELP phase_b.md — "apply_changes.py replaces the HC's
+    # facts/constraints arrays with the supplied content").
+    if "facts" in t:
+        hc["facts"] = t["facts"]
+    if "constraints" in t:
+        hc["constraints"] = t["constraints"]
     # After a re-confirmed version bump the handoff returns to 'available' unless agent specified.
     prev_status = hc.get("status")
     hc["status"] = t.get("to") or "available"
@@ -346,7 +353,9 @@ def _apply_handoff_version(status: dict, t: dict) -> list:
     # Mark consumers below the new version as stale.
     for ce in hc.get("consumed_status") or []:
         cv = ce.get("consumed_version")
-        if cv is None or (isinstance(cv, int) and cv < new_v):
+        # B2 fix: only mark stale if consumer previously consumed an older
+        # version. cv == None means "never consumed" (pending), not "outdated".
+        if isinstance(cv, int) and cv < new_v:
             prev_cs = ce.get("status")
             if prev_cs != "stale":
                 ce["status"] = "stale"
@@ -529,6 +538,33 @@ def _apply_precondition_register(status: dict, t: dict) -> list:
         if gate_row:
             rows.append(gate_row)
     return rows
+
+
+def _sync_gate_checks(status: dict) -> None:
+    """B4 fix: sync gate check statuses from precondition statuses.
+
+    Gates mirror preconditions: each gate.checks[].id corresponds to a
+    precondition id. After any precondition status change, recompute the
+    gate's aggregate status.
+    """
+    pc_status_by_id = {
+        pc["id"]: pc.get("status", "pending")
+        for pc in (status.get("preconditions") or [])
+    }
+    for gate in status.get("gates") or []:
+        checks = gate.get("checks") or []
+        for check in checks:
+            pc_id = check.get("id")
+            if pc_id in pc_status_by_id:
+                check["status"] = pc_status_by_id[pc_id]
+        if not checks:
+            gate["status"] = "passing"
+        elif all(c.get("status") == "passing" for c in checks):
+            gate["status"] = "passing"
+        elif any(c.get("status") == "failed" for c in checks):
+            gate["status"] = "failed"
+        else:
+            gate["status"] = "pending"
 
 
 def main():
@@ -810,6 +846,8 @@ def _main_locked(project: str, status_path: str, approved_path: str, changed_pat
             snap["file_hashes"] = changed["current_hashes"]
         if changed.get("method") == "git" and changed.get("head"):
             snap["git_baseline"] = changed["head"]
+    # B4 fix: sync gate check statuses after precondition transitions.
+    _sync_gate_checks(status)
     # B6 fix: ALWAYS merge per-transition path hashes so PSS/ELP callers (which
     # don't pre-run scan_changes) keep snapshots in sync. Runs AFTER the
     # changed_files.json drain above so a full-tree scan_changes table is
