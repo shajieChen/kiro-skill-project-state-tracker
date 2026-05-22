@@ -155,7 +155,7 @@ Each step declares Input/Output/Fail contracts. Step 4 is the ONLY step requirin
 | Step | Action | Input | Output | Fail |
 |------|--------|-------|--------|------|
 | 0 | **Drain `pending_writebacks.json`** (see §9) → `scan_changes.py` (dirty probe; inspect `changes[]` count) | project path | `{status, dirty_files[]}` | scan `"error"` → `status.yaml` likely missing/corrupt; abort AUDIT, route to §3 INIT family |
-| 1 | `scan_changes.py` | project path | `changed_files.json` | empty AND no drained writebacks AND `status.yaml` mtime unchanged since last AUDIT → fast-exit (skip to Step 7 render-skip check) |
+| 1 | `scan_changes.py` | project path | `changed_files.json` | empty AND no drained writebacks AND `status.yaml` mtime ≤ `session_memory.json`.last_run (if session_memory missing, never fast-exit) → fast-exit (skip to Step 7 render-skip check) |
 | 2 | Re-extract metadata + derive groups | changed_files + sources | updated artifact records (incl. `group` field) | parse error → `requires_agent_review: true` |
 | 2.5 | **Incremental PC generation** (§6C) — scan artifacts for LPs missing PCs and append; covers PSS-added LPs | status.yaml | updated `preconditions[]` + Gate G-001 if needed | — |
 | 2.6 | **Pending-consumers backfill** (§6F) — scan every HC's `pending_consumers[]`; for each token resolvable against current `artifacts[].id`, move it to `consumed_by[]` and add a `consumed_status` `{consumer, status: pending, consumed_version: null, consumed_at: null}` row. Tokens that still do not resolve stay in `pending_consumers[]` for a future cycle. Never delete an entry that did not resolve. | status.yaml | updated `handoff_contexts[*].consumed_by` and `consumed_status` | — |

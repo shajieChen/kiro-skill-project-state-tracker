@@ -59,18 +59,8 @@ def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def next_id(existing_ids: list[str], prefix: str) -> str:
-    n = 1
-    used = set()
-    for x in existing_ids:
-        if isinstance(x, str) and x.startswith(prefix):
-            try:
-                used.add(int(x[len(prefix):]))
-            except ValueError:
-                pass
-    while n in used:
-        n += 1
-    return f"{prefix}{n:03d}"
+# next_id: imported from _yaml_compat (canonical single implementation).
+from _yaml_compat import next_id  # noqa: E402
 
 
 def atomic_write(path: str, text: str):

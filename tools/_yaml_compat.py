@@ -319,3 +319,36 @@ except ImportError:
 
     def dump(data) -> str:
         return _emit(data, 0) + "\n"
+
+
+# ------------------------------------------------------------------
+# Shared ID generation (used by apply_changes.py and _spec_helpers.py)
+# ------------------------------------------------------------------
+
+import re as _re
+
+
+def next_id(existing_ids: list, prefix: str, pad: int = 3) -> str:
+    """Return next sequential id for prefix (e.g. prefix='CE-' -> 'CE-007').
+
+    Scans existing_ids for strings matching '<prefix><digits>' and returns
+    the next unused number, zero-padded to `pad` digits.
+
+    Convention: prefix INCLUDES the separator (e.g. 'CE-', 'HC-', 'R-', 'LP-').
+    Result: prefix + zero-padded number (e.g. 'CE-001').
+
+    This is the single canonical implementation. Both apply_changes.py and
+    project-state-spec/_spec_helpers.py delegate to this function.
+    """
+    pattern = _re.compile(rf"^{_re.escape(prefix)}(\d+)$")
+    used = set()
+    for x in existing_ids:
+        if not isinstance(x, str):
+            continue
+        m = pattern.match(x)
+        if m:
+            used.add(int(m.group(1)))
+    n = 1
+    while n in used:
+        n += 1
+    return f"{prefix}{n:0{pad}d}"
