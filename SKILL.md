@@ -109,6 +109,8 @@ The §3C branch handles the common case where Execute-LandingPrompt has scaffold
 | "create handoff for LP-*" | §4 | Generate HC for specified LP |
 | "check handoff status" | — | Render handoff_view |
 | "review" / "审计质量" / "quality check" / "review landing quality" / "review quality" | §11 | Ready LP quality audit |
+| "归档 X" / "archive X" | §12 | Group archive |
+| "激活 X" / "reactivate X" | §12 | Group reactivate |
 
 **Note on "init" routing:** User-typed "init" routes to the §3 family, but the specific sub-mode (§3A / §3B / §3C) is still chosen by the existence checks at the top of this section. In particular, "init" against an ELP-scaffolded workspace (status.yaml exists, tools/views missing) resolves to **§3C INIT_COMPLETE_SCAFFOLD**, NOT §3A. This preserves the ELP-authored artifact records — §3A's full re-inference is reserved for true greenfield projects with no prior status.yaml.
 
@@ -340,6 +342,69 @@ view C:\Users\chenshajie\.kiro\skills\project-state-tracker\review_mode.md
 Trigger: "review" / "审计质量" / "quality check" / "review landing quality" / "review quality"
 
 Preconditions: `status/status.yaml` exists + at least one LP artifact with `status == "ready"`.
+
+---
+
+## §12 ARCHIVE Mode — Group Lifecycle
+
+Triggered by: "归档 X" / "archive X" / "reactivate X" / "激活 X"
+
+Preconditions: `status/status.yaml` exists AND `groups[]` block exists AND the named group is present.
+
+### Groups (opt-in feature isolation)
+
+`groups[]` is an optional top-level block in status.yaml. When present, artifacts with a matching `group` field are logically grouped into features. Archived groups (`status: archived`) are excluded from propagation and hidden in views. When `groups[]` is absent, all behavior is unchanged.
+
+```yaml
+groups:
+- name: dark-mode
+  status: active
+  created: "2026-05-22T10:00:00"
+  description: "Dark mode theme support"
+```
+
+### Archive Flow
+
+1. Build `approved_transitions.json` with a single `group_archive` op:
+   ```json
+   {
+     "event_summary": "Archive group: <name>",
+     "event_type": "group_archive",
+     "transitions": [
+       {"op": "group_archive", "group": "<name>", "reason": "User requested archive", "source": "project-state-tracker"}
+     ]
+   }
+   ```
+2. Invoke `python tools/apply_changes.py --project <p>`.
+3. Render views.
+4. Emit report (§5 format).
+
+### Reactivate Flow
+
+1. Find the most recent `change_event` with `event_type: group_archive` for this group.
+2. Extract `pre_archive_states` from that event.
+3. Build `approved_transitions.json` with a `group_reactivate` op:
+   ```json
+   {
+     "event_summary": "Reactivate group: <name>",
+     "event_type": "group_reactivate",
+     "transitions": [
+       {"op": "group_reactivate", "group": "<name>", "pre_archive_states": {...}, "reason": "User requested reactivate", "source": "project-state-tracker"}
+     ]
+   }
+   ```
+4. Invoke `python tools/apply_changes.py --project <p>`.
+5. Render views.
+6. Emit report (§5 format).
+
+### Archived Group Behavior
+
+| Component | Behavior |
+|-----------|----------|
+| propagate.py | Skips artifacts with `group` matching an archived group |
+| views | Hides archived group artifacts from active display |
+| ELP | Refuses to execute LPs in archived groups |
+| PSS | Does not scaffold into archived groups |
 
 ---
 ---
