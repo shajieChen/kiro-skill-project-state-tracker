@@ -59,6 +59,13 @@ Generate Gate G-001 if any LP has PCs. Sequential IDs: PC-001, PC-002...
 - Existing PCs are NEVER mutated by AUDIT (only their `status` field is recomputed). The "add missing only" rule preserves user-edited PC overrides.
 - New PCs append to `preconditions[]` with sequential ids; if Gate G-001 doesn't exist yet but at least one PC now exists, create G-001 in the same audit cycle.
 - This MUST run before Step 3 (`propagate.py`) so propagation sees the new PCs.
+- AUDIT Step 2.5 MUST also scan for LPs whose `consumes_handoffs[]` is non-empty
+  but have no matching `preconditions[*] WHERE target == <LP id> AND
+  requires[*].handoff == <consumed HC id>`. For each missing HC-guarding PC, add:
+  `{id: <next PC id>, target: <LP id>, requires: [{handoff: <HC id>, field: "status", in: ["available", "consumed"]}], status: "pending"}`
+  and wire the new PC into Gate G-001 (create G-001 if absent). This covers the
+  gap where PSS scaffolds LPs with consumes_handoffs but no AUDIT has run yet to
+  generate the guarding PCs.
 
 ### §6F Handoff Context Management
 
