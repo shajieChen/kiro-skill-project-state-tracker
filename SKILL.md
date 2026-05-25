@@ -180,6 +180,29 @@ For each candidate transition:
 
 **Batch processing (>10 files):** Process in batches of 5, cache intermediates.
 
+### LP Update from AC Changes (Rule 6 integration)
+
+When `candidate_transitions.json` contains an `lp_update_candidates` field:
+
+1. Read `lp_update_candidates.ac_diff` to understand what changed
+2. For each entry in `affected_lps`:
+   - If `change_level == "patch"`: confidence ≥90%, auto-generate patch content
+     - Read current LP's `# Acceptance Gates` section
+     - Replace AC references with updated statements from `ac_diff.modified`
+     - Write to update-manifest `patch_sections.acceptance_gates`
+   - If `change_level == "rewrite"`: confidence 60-89%, present diff to user
+     - Show old vs new AC statements
+     - If user approves: generate full LP + TP content, write to tmpfiles
+     - Write to update-manifest with `mode: "rewrite"`
+3. For each `uncovered_acs` entry: generate new LP + TP, add to `new_lps[]`
+4. Invoke: `python <meta.pss_script_path or fallback> --stage update --topic <topic> --pst-root <project> --update-manifest <tmpfile>`
+5. Continue with normal AUDIT Step 5-8
+
+**PSS script path resolution:**
+1. `meta.pss_script_path` in status.yaml
+2. `~/.kiro/skills/project-state-spec/tools/scaffold_spec.py`
+3. Workspace `project-state-spec/tools/scaffold_spec.py`
+
 ---
 
 ## §5 Output Report
